@@ -42,42 +42,50 @@ def get_admin_db():
 # 🗄️ ADMIN DATABASE SETUP (PostgreSQL)
 # ==========================================
 def init_db():
-    if not DATABASE_URL: return
-    conn = get_admin_db()
-    c = conn.cursor()
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS admins (username TEXT PRIMARY KEY, password TEXT, role TEXT)''')
-    c.execute("SELECT count(*) FROM admins")
-    if c.fetchone()[0] == 0:
-        c.execute("INSERT INTO admins (username, password, role) VALUES (%s, %s, %s)", ("admin", hash_pass("CyberAdmin123"), "superadmin"))
-
-    c.execute('''CREATE TABLE IF NOT EXISTS api_keys (
-        api_key TEXT PRIMARY KEY, owner_name TEXT, expiry_date TEXT, max_limit INTEGER, 
-        used_count INTEGER DEFAULT 0, is_active INTEGER DEFAULT 1, created_date TEXT, 
-        rate_limit_seconds INTEGER DEFAULT 1, last_request_time TEXT, allowed_ip TEXT,
-        key_type TEXT DEFAULT 'id', expiry_alert_sent INTEGER DEFAULT 0
-    )''')
-    
-    try: 
-        c.execute("ALTER TABLE api_keys ADD COLUMN key_type TEXT DEFAULT 'id'")
-        conn.commit()
-    except: conn.rollback()
+    if not DATABASE_URL: 
+        print("❌ DATABASE_URL not set!")
+        return
     try:
-        c.execute("ALTER TABLE api_keys ADD COLUMN expiry_alert_sent INTEGER DEFAULT 0")
+        conn = get_admin_db()
+        c = conn.cursor()
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS admins (username TEXT PRIMARY KEY, password TEXT, role TEXT)''')
         conn.commit()
-    except: conn.rollback()
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS search_logs (
-        id SERIAL PRIMARY KEY, api_key TEXT, number TEXT, status TEXT, timestamp TEXT, ip_address TEXT
-    )''')
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
-    for k, v in [("maintenance", "0"), ("global_rate_limit", "1"), ("tg_token", ""), ("tg_chatid", "")]:
-        c.execute(f"INSERT INTO settings (key, value) VALUES ('{k}', '{v}') ON CONFLICT (key) DO NOTHING")
-    
-    conn.commit()
-    c.close()
-    conn.close()
+        
+        c.execute("SELECT count(*) FROM admins")
+        if c.fetchone()[0] == 0:
+            c.execute("INSERT INTO admins (username, password, role) VALUES (%s, %s, %s)", ("admin", hash_pass("CyberAdmin123"), "superadmin"))
+            conn.commit()
+
+        c.execute('''CREATE TABLE IF NOT EXISTS api_keys (
+            api_key TEXT PRIMARY KEY, owner_name TEXT, expiry_date TEXT, max_limit INTEGER, 
+            used_count INTEGER DEFAULT 0, is_active INTEGER DEFAULT 1, created_date TEXT, 
+            rate_limit_seconds INTEGER DEFAULT 1, last_request_time TEXT, allowed_ip TEXT,
+            key_type TEXT DEFAULT 'id', expiry_alert_sent INTEGER DEFAULT 0
+        )''')
+        conn.commit()
+        
+        c.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_type TEXT DEFAULT 'id'")
+        c.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expiry_alert_sent INTEGER DEFAULT 0")
+        conn.commit()
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS search_logs (
+            id SERIAL PRIMARY KEY, api_key TEXT, number TEXT, status TEXT, timestamp TEXT, ip_address TEXT
+        )''')
+        conn.commit()
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
+        conn.commit()
+        
+        for k, v in [("maintenance", "0"), ("global_rate_limit", "1"), ("tg_token", ""), ("tg_chatid", "")]:
+            c.execute(f"INSERT INTO settings (key, value) VALUES ('{k}', '{v}') ON CONFLICT (key) DO NOTHING")
+        conn.commit()
+        
+        c.close()
+        conn.close()
+        print("✅ Admin DB initialized successfully!")
+    except Exception as e:
+        print(f"❌ Admin DB Init Error: {e}")
 
 init_db()
 
@@ -142,9 +150,9 @@ async def lifespan(app: FastAPI):
         vfs = HTTPRangeVFS("httpvfs", url=DB_URL, token=HF_TOKEN)
         db_conn = apsw.Connection("remote_db.sqlite", flags=apsw.SQLITE_OPEN_READONLY, vfs="httpvfs")
         db_conn.execute("PRAGMA query_only = ON;")
-        print("✅ Database ready!")
+        print("✅ Remote DB ready!")
     except Exception as e:
-        print(f"❌ DB Error: {e}")
+        print(f"❌ Remote DB Error: {e}")
         raise e
         
     alert_task = asyncio.create_task(check_expiry_alerts())
