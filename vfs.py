@@ -1,13 +1,7 @@
-"""
-HTTP Range Request VFS for SQLite using apsw.
-Reads a remote SQLite file (e.g. on Hugging Face) without full download.
-"""
 import threading
 from collections import OrderedDict
-
 import apsw
 import requests
-
 
 class HTTPRangeVFS(apsw.VFS):
     def __init__(self, vfsname="httpvfs", token=None):
@@ -19,10 +13,9 @@ class HTTPRangeVFS(apsw.VFS):
         filename = name[0] or name[1]
         return HTTPRangeFile(filename, self.vfsname_, self.token)
 
-
 class HTTPRangeFile(apsw.VFSFile):
     PAGE_SIZE = 4096
-    CACHE_MAX = 512  # ~2MB RAM cache
+    CACHE_MAX = 512 # ~2MB RAM Cache
 
     def __init__(self, url, vfsname, token=None):
         self.url = url
@@ -50,7 +43,6 @@ class HTTPRangeFile(apsw.VFSFile):
             h["Authorization"] = f"Bearer {self.token}"
         return h
 
-    # ---------- Required VFS methods ----------
     def xRead(self, amount, offset):
         if self.size == 0 or offset >= self.size:
             return b""
@@ -60,6 +52,7 @@ class HTTPRangeFile(apsw.VFSFile):
             if key in self.cache:
                 self.cache.move_to_end(key)
                 return self.cache[key]
+                
         headers = self._headers()
         headers["Range"] = f"bytes={offset}-{end}"
         try:
@@ -68,44 +61,23 @@ class HTTPRangeFile(apsw.VFSFile):
             data = r.content
         except Exception:
             return b""
+            
         with self.lock:
             self.cache[key] = data
             if len(self.cache) > self.CACHE_MAX:
                 self.cache.popitem(last=False)
         return data
 
-    def xWrite(self, data, offset):
-        raise apsw.ReadOnlyError()
-
-    def xTruncate(self, newsize):
-        raise apsw.ReadOnlyError()
-
-    def xSync(self, flags):
-        return None
-
-    def xFileSize(self):
-        return self.size
-
-    def xLock(self, level):
-        return None
-
-    def xUnlock(self, level):
-        return None
-
-    def xCheckReservedLock(self):
-        return False
-
-    def xFileControl(self, op, ptr):
-        return False
-
-    def xSectorSize(self):
-        return self.PAGE_SIZE
-
-    def xDeviceCharacteristics(self):
-        return apsw.SQLITE_IOCAP_IMMUTABLE | apsw.SQLITE_IOCAP_ATOMIC
-
+    def xWrite(self, data, offset): raise apsw.ReadOnlyError()
+    def xTruncate(self, newsize): raise apsw.ReadOnlyError()
+    def xSync(self, flags): return None
+    def xFileSize(self): return self.size
+    def xLock(self, level): return None
+    def xUnlock(self, level): return None
+    def xCheckReservedLock(self): return False
+    def xFileControl(self, op, ptr): return False
+    def xSectorSize(self): return self.PAGE_SIZE
+    def xDeviceCharacteristics(self): return apsw.SQLITE_IOCAP_IMMUTABLE | apsw.SQLITE_IOCAP_ATOMIC
     def xClose(self):
-        try:
-            self.session.close()
-        except Exception:
-            pass
+        try: self.session.close()
+        except: pass
