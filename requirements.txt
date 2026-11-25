@@ -3,3 +3,4 @@ uvicorn==0.30.6
 apsw==3.46.1.0
 requests==2.32.3
 python-multipart==0.0.9
+psycopg2-binary==2.9.9
