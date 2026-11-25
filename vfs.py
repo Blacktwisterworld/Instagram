@@ -10,7 +10,6 @@ class HTTPRangeVFS(apsw.VFS):
         super().__init__(vfsname, base="")
 
     def xOpen(self, name, flags):
-        # Naye apsw version mein name ek object hota hai, uska URL nikalne ka sahi tarika
         if hasattr(name, 'uri'):
             filename = name.uri
         else:
@@ -20,7 +19,7 @@ class HTTPRangeVFS(apsw.VFS):
 
 class HTTPRangeFile(apsw.VFSFile):
     PAGE_SIZE = 4096
-    CACHE_MAX = 512  # ~2MB RAM Cache
+    CACHE_MAX = 512 
 
     def __init__(self, url, vfsname, token=None):
         self.url = url
@@ -35,15 +34,27 @@ class HTTPRangeFile(apsw.VFSFile):
     def _init_size(self):
         headers = self._headers()
         try:
-            r = self.session.head(self.url, headers=headers, allow_redirects=True, timeout=30)
-            if r.status_code >= 400:
-                raise RuntimeError(f"HEAD {self.url} -> {r.status_code}")
-            self.size = int(r.headers.get("Content-Length", 0))
+            # HF kabhi kabhi HEAD request block karta hai, isliye GET se size nikal rahe hain
+            headers["Range"] = "bytes=0-1"
+            r = self.session.get(self.url, headers=headers, allow_redirects=True, timeout=30)
+            
+            if r.status_code in (200, 206):
+                content_range = r.headers.get("Content-Range")
+                if content_range:
+                    self.size = int(content_range.split("/")[-1])
+                else:
+                    self.size = int(r.headers.get("Content-Length", 0))
+            else:
+                r = self.session.head(self.url, headers=self._headers(), allow_redirects=True, timeout=30)
+                self.size = int(r.headers.get("Content-Length", 0))
         except Exception:
             self.size = 0
+            
+        if self.size == 0:
+            raise RuntimeError(f"File size 0 mila ya URL galat hai: {self.url}")
 
     def _headers(self):
-        h = {}
+        h = {"User-Agent": "Mozilla/5.0"}
         if self.token:
             h["Authorization"] = f"Bearer {self.token}"
         return h
@@ -62,10 +73,12 @@ class HTTPRangeFile(apsw.VFSFile):
         headers["Range"] = f"bytes={offset}-{end}"
         try:
             r = self.session.get(self.url, headers=headers, allow_redirects=True, timeout=30)
-            r.raise_for_status()
+            if r.status_code not in (200, 206):
+                raise RuntimeError(f"HTTP {r.status_code} aaya padhte waqt")
             data = r.content
-        except Exception:
-            return b""
+        except Exception as e:
+            # Agar network fail ho toh error raise karo, empty mat bhejo warna SQLite khali table padhega
+            raise apsw.IOError(f"Network error {self.url} se padhte waqt: {e}")
             
         with self.lock:
             self.cache[key] = data
