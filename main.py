@@ -108,8 +108,11 @@ async def lifespan(app: FastAPI):
         raise Exception("DB_URL env variable missing!")
         
     try:
-        vfs = HTTPRangeVFS("httpvfs", token=HF_TOKEN)
-        db_conn = apsw.Connection(DB_URL, flags=apsw.SQLITE_OPEN_READONLY, vfs="httpvfs")
+        # VFS mein asli URL pass kar rahe hain
+        vfs = HTTPRangeVFS("httpvfs", url=DB_URL, token=HF_TOKEN)
+        
+        # SQLite ko dummy naam de rahe hain taaki wo path na badle
+        db_conn = apsw.Connection("remote_db.sqlite", flags=apsw.SQLITE_OPEN_READONLY, vfs="httpvfs")
         db_conn.execute("PRAGMA query_only = ON;")
         print("✅ Database ready! API is live.")
     except Exception as e:
@@ -294,7 +297,7 @@ async def remove_subadmin(username: str, admin: dict = Depends(verify_admin)):
     return {"success": True}
 
 # ==========================================
-# 🖥️ ADMIN HTML (With updated Key Types)
+# 🖥️ ADMIN HTML
 # ==========================================
 ADMIN_HTML = """
 <!DOCTYPE html>
