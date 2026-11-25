@@ -12,10 +12,12 @@
   select { padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 6px; background: #fff; }
   button { padding: 10px 20px; background: #2563eb; color: #fff; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; }
   button:disabled { background: #94a3b8; cursor: wait; }
+  button.reset { background: #64748b; }
   .result { background: #fff; padding: 20px; border-radius: 10px; margin-top: 24px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); overflow-x: auto; }
   .loading { color: #555; }
   .error { color: #b91c1c; }
   .empty { color: #666; }
+  .ok { color: #047857; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eee; vertical-align: top; }
   th { background: #f1f5f9; }
@@ -37,6 +39,7 @@
       <option value="name">Name</option>
     </select>
     <button id="btn">Search</button>
+    <button id="reset" class="reset" title="Change API key">🔑 Reset Key</button>
   </div>
 
   <div id="result" class="result">
@@ -46,17 +49,26 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const btn = $('btn');
+const resetBtn = $('reset');
 
 async function search() {
   const q = $('q').value.trim();
   const field = $('field').value;
   const result = $('result');
   if (!q) return;
+
+  let apikey = localStorage.getItem('apikey');
+  if (!apikey) {
+    apikey = prompt('Enter API key:');
+    if (!apikey) return;
+    localStorage.setItem('apikey', apikey);
+  }
+
   btn.disabled = true;
   result.innerHTML = '<p class="loading">⏳ Searching… (cold start may take up to 30s)</p>';
   const t0 = performance.now();
   try {
-    const res = await fetch(`/search?q=${encodeURIComponent(q)}&field=${encodeURIComponent(field)}&limit=10`);
+    const res = await fetch(`/search?q=${encodeURIComponent(q)}&field=${encodeURIComponent(field)}&limit=10&apikey=${encodeURIComponent(apikey)}`);
     const data = await res.json();
     const dt = (performance.now() - t0).toFixed(0);
     if (!res.ok) throw new Error(data.detail || 'Request failed');
@@ -64,7 +76,7 @@ async function search() {
       result.innerHTML = `<p class="empty">No results for <b>${esc(q)}</b> in <b>${dt}ms</b>.</p>`;
       return;
     }
-    let html = `<p><b>${data.count}</b> result(s) in <b>${dt}ms</b> (server: ${data.elapsed_ms}ms)</p>`;
+    let html = `<p class="ok"><b>${data.count}</b> result(s) in <b>${dt}ms</b> (server: ${data.elapsed_ms}ms)</p>`;
     html += '<table><thead><tr><th>ID</th><th>Username</th><th>Email</th><th>Phone</th><th>Name</th><th>Address</th></tr></thead><tbody>';
     for (const r of data.results) {
       html += `<tr>
@@ -75,6 +87,9 @@ async function search() {
     html += '</tbody></table>';
     result.innerHTML = html;
   } catch (e) {
+    if (String(e.message).toLowerCase().includes('invalid api key')) {
+      localStorage.removeItem('apikey');
+    }
     result.innerHTML = `<p class="error">❌ ${esc(e.message)}</p>`;
   } finally {
     btn.disabled = false;
@@ -87,6 +102,10 @@ function esc(s) {
 
 btn.addEventListener('click', search);
 $('q').addEventListener('keypress', e => { if (e.key === 'Enter') search(); });
+resetBtn.addEventListener('click', () => {
+  localStorage.removeItem('apikey');
+  $('result').innerHTML = '<p class="loading">API key cleared. Next search will ask again.</p>';
+});
 </script>
 </body>
 </html>
