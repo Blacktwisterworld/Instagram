@@ -61,6 +61,9 @@ def init_db():
             bot_id SERIAL PRIMARY KEY, bot_name TEXT, bot_token TEXT UNIQUE, is_active INTEGER DEFAULT 1, created_at TEXT
         )''')
         
+        # 🛑 Purana galat table delete karo taaki naya schema ban sake
+        c.execute("DROP TABLE IF EXISTS bot_users")
+        
         c.execute('''CREATE TABLE IF NOT EXISTS bot_users (
             telegram_id TEXT, bot_token TEXT, api_key TEXT, username TEXT, is_blocked INTEGER DEFAULT 0, joined_date TEXT,
             PRIMARY KEY (telegram_id, bot_token)
@@ -91,14 +94,13 @@ def set_setting(key, value):
     c.execute("UPDATE settings SET value = %s WHERE key = %s", (value, key))
     conn.commit(); c.close(); conn.close()
 
-# ✅ FIXED: Telegram message send function with Logging
 def send_tg_msg(bot_token, chat_id, text):
     if not bot_token or not chat_id: return
-    bot_token = str(bot_token).strip() # Space remove
+    bot_token = str(bot_token).strip()
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         r = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
-        print(f"✅ TG SEND [{chat_id}]: {r.status_code} - {r.text}") # Log print karega
+        print(f"✅ TG SEND [{chat_id}]: {r.status_code} - {r.text}")
     except Exception as e:
         print(f"❌ TG SEND ERROR: {e}")
 
@@ -154,11 +156,11 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 # ==========================================
-# 🤖 MULTI-BOT WEBHOOK (FIXED)
+# 🤖 MULTI-BOT WEBHOOK
 # ==========================================
 @app.post("/webhook/{bot_token}")
 async def telegram_webhook(bot_token: str, request: Request):
-    bot_token = bot_token.strip() # Fix: Space remove
+    bot_token = bot_token.strip()
     
     conn = get_admin_db(); c = conn.cursor()
     c.execute("SELECT is_active FROM bots WHERE bot_token = %s", (bot_token,))
@@ -183,7 +185,6 @@ async def telegram_webhook(bot_token: str, request: Request):
             c.close(); conn.close()
             return {"ok": True}
 
-        # ✅ FIXED: startswith handles /start and /start@botname
         if text.startswith("/start"):
             if user_row and user_row[1]:
                 send_tg_msg(bot_token, chat_id, f"Welcome back! You are logged in with Key: <code>{user_row[1]}</code>.\n\nSend me an ID, Phone, Username or Email to search.")
@@ -374,10 +375,9 @@ class BotPayload(BaseModel):
     name: str
     token: str
 
-# ✅ FIXED: Strip token and dynamically get base URL
 @app.post("/api/admin/add_bot")
 async def add_bot(payload: BotPayload, request: Request, admin: dict = Depends(verify_admin)):
-    token = payload.token.strip() # Space hatao
+    token = payload.token.strip()
     name = payload.name.strip()
     conn = get_admin_db(); c = conn.cursor()
     try:
