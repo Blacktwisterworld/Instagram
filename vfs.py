@@ -4,18 +4,16 @@ import apsw
 import requests
 
 class HTTPRangeVFS(apsw.VFS):
-    def __init__(self, vfsname="httpvfs", token=None):
+    # Yahan humne 'url' parameter add kiya hai
+    def __init__(self, vfsname="httpvfs", url=None, token=None):
         self.vfsname_ = vfsname
+        self.url = url
         self.token = token
         super().__init__(vfsname, base="")
 
     def xOpen(self, name, flags):
-        if hasattr(name, 'uri'):
-            filename = name.uri
-        else:
-            filename = str(name)
-            
-        return HTTPRangeFile(filename, self.vfsname_, self.token)
+        # SQLite jo bhi naam de, hum apna asli URL use karenge
+        return HTTPRangeFile(self.url, self.vfsname_, self.token)
 
 class HTTPRangeFile(apsw.VFSFile):
     PAGE_SIZE = 4096
@@ -47,11 +45,11 @@ class HTTPRangeFile(apsw.VFSFile):
             else:
                 r = self.session.head(self.url, headers=self._headers(), allow_redirects=True, timeout=30)
                 self.size = int(r.headers.get("Content-Length", 0))
-        except Exception:
+        except Exception as e:
             self.size = 0
             
         if self.size == 0:
-            raise RuntimeError(f"File size 0 mila ya URL galat hai: {self.url}")
+            raise RuntimeError(f"File size 0 mila. HuggingFace URL ya Token check karo. Error: {self.url}")
 
     def _headers(self):
         h = {"User-Agent": "Mozilla/5.0"}
@@ -74,11 +72,10 @@ class HTTPRangeFile(apsw.VFSFile):
         try:
             r = self.session.get(self.url, headers=headers, allow_redirects=True, timeout=30)
             if r.status_code not in (200, 206):
-                raise RuntimeError(f"HTTP {r.status_code} aaya padhte waqt")
+                raise RuntimeError(f"HTTP {r.status_code}")
             data = r.content
         except Exception as e:
-            # Agar network fail ho toh error raise karo, empty mat bhejo warna SQLite khali table padhega
-            raise apsw.IOError(f"Network error {self.url} se padhte waqt: {e}")
+            raise apsw.IOError(f"Network error: {e}")
             
         with self.lock:
             self.cache[key] = data
