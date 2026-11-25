@@ -10,12 +10,17 @@ class HTTPRangeVFS(apsw.VFS):
         super().__init__(vfsname, base="")
 
     def xOpen(self, name, flags):
-        filename = name[0] or name[1]
+        # Naye apsw version mein name ek object hota hai, uska URL nikalne ka sahi tarika
+        if hasattr(name, 'uri'):
+            filename = name.uri
+        else:
+            filename = str(name)
+            
         return HTTPRangeFile(filename, self.vfsname_, self.token)
 
 class HTTPRangeFile(apsw.VFSFile):
     PAGE_SIZE = 4096
-    CACHE_MAX = 512 # ~2MB RAM Cache
+    CACHE_MAX = 512  # ~2MB RAM Cache
 
     def __init__(self, url, vfsname, token=None):
         self.url = url
