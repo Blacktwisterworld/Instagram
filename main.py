@@ -29,8 +29,6 @@ CREDITS = {
     "developer": "Cyber_insight_309",
     "name": "Devid",
     "telegram": "@cyber_insight_309",
-    "co_developer": "Gope",
-    "co_developer_name": "Annomous"
 }
 
 def hash_pass(pwd):
