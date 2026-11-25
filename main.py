@@ -6,6 +6,7 @@ import psycopg2
 import secrets
 import hashlib
 import requests
+import httpx
 from fastapi import FastAPI, Request, Form, Depends, HTTPException, status, Query
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -94,13 +95,33 @@ def set_setting(key, value):
     c.execute("UPDATE settings SET value = %s WHERE key = %s", (value, key))
     conn.commit(); c.close(); conn.close()
 
-def send_tg_msg(bot_token, chat_id, text):
+# ==========================================
+# 🤖 TELEGRAM SEND FUNCTIONS (FIXED FOR ASYNC)
+# ==========================================
+async def send_tg_msg_async(bot_token, chat_id, text):
     if not bot_token or not chat_id: return
     bot_token = str(bot_token).strip()
     try:
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        r = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
-        print(f"✅ TG SEND [{chat_id}]: {r.status_code} - {r.text}")
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage", 
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, 
+                timeout=10.0
+            )
+            print(f"✅ TG SEND [{chat_id}]: {r.status_code}")
+    except Exception as e:
+        print(f"❌ TG SEND ERROR: {e}")
+
+def send_tg_msg_sync(bot_token, chat_id, text):
+    if not bot_token or not chat_id: return
+    bot_token = str(bot_token).strip()
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage", 
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, 
+            timeout=10
+        )
+        print(f"✅ TG SEND [{chat_id}]: {r.status_code}")
     except Exception as e:
         print(f"❌ TG SEND ERROR: {e}")
 
@@ -122,11 +143,11 @@ async def check_expiry_alerts():
                     c.execute("SELECT bot_token FROM bots WHERE is_active = 1 LIMIT 1")
                     admin_bot = c.fetchone()
                     if admin_chat and admin_bot:
-                        send_tg_msg(admin_bot[0], admin_chat, f"⚠️ <b>Key Expiring Soon!</b>\n\nClient: {owner}\nKey: <code>{key}</code>\nExpiry: {exp}")
+                        send_tg_msg_sync(admin_bot[0], admin_chat, f"⚠️ <b>Key Expiring Soon!</b>\n\nClient: {owner}\nKey: <code>{key}</code>\nExpiry: {exp}")
                     c.execute("SELECT telegram_id, bot_token FROM bot_users WHERE api_key = %s", (key,))
                     bot_users = c.fetchall()
                     for user in bot_users:
-                        send_tg_msg(user[1], user[0], f"⚠️ <b>Your API Key is expiring in 3 days!</b>\n\nKey: <code>{key}</code>\nExpiry: {exp}\n\nPlease contact admin to renew.")
+                        send_tg_msg_sync(user[1], user[0], f"⚠️ <b>Your API Key is expiring in 3 days!</b>\n\nKey: <code>{key}</code>\nExpiry: {exp}\n\nPlease contact admin to renew.")
                     c.execute("UPDATE api_keys SET expiry_alert_sent = 1 WHERE api_key = %s", (key,))
                     conn.commit()
                 c.close(); conn.close()
@@ -181,15 +202,15 @@ async def telegram_webhook(bot_token: str, request: Request):
         user_row = c.fetchone()
         
         if user_row and user_row[0] == 1:
-            send_tg_msg(bot_token, chat_id, "🚫 You are blocked by Admin.")
+            await send_tg_msg_async(bot_token, chat_id, "🚫 You are blocked by Admin.")
             c.close(); conn.close()
             return {"ok": True}
 
         if text.startswith("/start"):
             if user_row and user_row[1]:
-                send_tg_msg(bot_token, chat_id, f"Welcome back! You are logged in with Key: <code>{user_row[1]}</code>.\n\nSend me an ID, Phone, Username or Email to search.")
+                await send_tg_msg_async(bot_token, chat_id, f"Welcome back! You are logged in with Key: <code>{user_row[1]}</code>.\n\nSend me an ID, Phone, Username or Email to search.")
             else:
-                send_tg_msg(bot_token, chat_id, "Welcome! 🔐 Please send your <b>API Key</b> to login (e.g. HTK-XXXX).")
+                await send_tg_msg_async(bot_token, chat_id, "Welcome! 🔐 Please send your <b>API Key</b> to login (e.g. HTK-XXXX).")
             c.close(); conn.close()
             return {"ok": True}
 
@@ -199,16 +220,16 @@ async def telegram_webhook(bot_token: str, request: Request):
             api_row = c.fetchone()
             if api_row:
                 if api_row[2] == 0 or datetime.strptime(api_row[1], "%Y-%m-%d").date() < datetime.now().date():
-                    send_tg_msg(bot_token, chat_id, "❌ This API Key is expired or blocked.")
+                    await send_tg_msg_async(bot_token, chat_id, "❌ This API Key is expired or blocked.")
                 else:
                     c.execute("""INSERT INTO bot_users (telegram_id, bot_token, api_key, username, joined_date) 
                                  VALUES (%s, %s, %s, %s, %s) 
                                  ON CONFLICT (telegram_id, bot_token) DO UPDATE SET api_key = EXCLUDED.api_key, is_blocked = 0""", 
                               (chat_id, bot_token, text, tg_username, datetime.now().strftime("%Y-%m-%d")))
                     conn.commit()
-                    send_tg_msg(bot_token, chat_id, f"✅ Login Successful!\nKey Type: <b>{api_row[3].upper()}</b>.\n\nNow send me a search query.")
+                    await send_tg_msg_async(bot_token, chat_id, f"✅ Login Successful!\nKey Type: <b>{api_row[3].upper()}</b>.\n\nNow send me a search query.")
             else:
-                send_tg_msg(bot_token, chat_id, "❌ Invalid API Key. Please check and send again.")
+                await send_tg_msg_async(bot_token, chat_id, "❌ Invalid API Key. Please check and send again.")
             c.close(); conn.close()
             return {"ok": True}
 
@@ -218,21 +239,21 @@ async def telegram_webhook(bot_token: str, request: Request):
         api_data = c.fetchone()
         
         if not api_data or api_data[3] == 0 or datetime.strptime(api_data[0], "%Y-%m-%d").date() < datetime.now().date():
-            send_tg_msg(bot_token, chat_id, "❌ Your API Key is expired or blocked.")
+            await send_tg_msg_async(bot_token, chat_id, "❌ Your API Key is expired or blocked.")
             c.close(); conn.close()
             return {"ok": True}
 
         expiry, max_limit, used_count, is_active, rate_limit, last_req_str, key_type = api_data
 
         if used_count >= max_limit:
-            send_tg_msg(bot_token, chat_id, "❌ API Limit Exceeded. Please contact admin.")
+            await send_tg_msg_async(bot_token, chat_id, "❌ API Limit Exceeded. Please contact admin.")
             c.close(); conn.close()
             return {"ok": True}
             
         if last_req_str:
             last_req_time = datetime.strptime(last_req_str, "%Y-%m-%d %H:%M:%S")
             if (datetime.now() - last_req_time).total_seconds() < rate_limit:
-                send_tg_msg(bot_token, chat_id, f"⏳ Rate limit exceeded. Please wait {rate_limit} seconds.")
+                await send_tg_msg_async(bot_token, chat_id, f"⏳ Rate limit exceeded. Please wait {rate_limit} seconds.")
                 c.close(); conn.close()
                 return {"ok": True}
 
@@ -252,7 +273,7 @@ async def telegram_webhook(bot_token: str, request: Request):
             desc = cursor.getdescription()
             results = [{col[0]: r[i] for i, col in enumerate(desc)} for r in cursor]
         except Exception as e:
-            send_tg_msg(bot_token, chat_id, f"❌ Database Error: {e}")
+            await send_tg_msg_async(bot_token, chat_id, f"❌ Database Error: {e}")
             c.close(); conn.close()
             return {"ok": True}
 
@@ -270,7 +291,7 @@ async def telegram_webhook(bot_token: str, request: Request):
         else:
             reply = f"❌ No results found for <b>{text}</b>."
 
-        send_tg_msg(bot_token, chat_id, reply)
+        await send_tg_msg_async(bot_token, chat_id, reply)
         c.close(); conn.close()
         
     except Exception as e:
@@ -430,14 +451,14 @@ class MessagePayload(BaseModel):
 @app.post("/api/admin/send_message")
 async def send_message(payload: MessagePayload, admin: dict = Depends(verify_admin)):
     if payload.tg_id:
-        send_tg_msg(payload.bot_token, payload.tg_id, payload.message)
+        await send_tg_msg_async(payload.bot_token, payload.tg_id, payload.message)
         return {"success": True, "sent": 1}
     else:
         conn = get_admin_db(); c = conn.cursor()
         c.execute("SELECT telegram_id FROM bot_users WHERE bot_token = %s AND is_blocked = 0", (payload.bot_token,))
         users = c.fetchall()
         c.close(); conn.close()
-        for u in users: send_tg_msg(payload.bot_token, u[0], payload.message)
+        for u in users: await send_tg_msg_async(payload.bot_token, u[0], payload.message)
         return {"success": True, "sent": len(users)}
 
 class SettingsPayload(BaseModel):
@@ -451,7 +472,7 @@ async def update_settings(payload: SettingsPayload, admin: dict = Depends(verify
     return {"success": True}
 
 # ==========================================
-# 🖥️ ADMIN HTML
+# 🖥️ ADMIN HTML (Same UI)
 # ==========================================
 ADMIN_HTML = """
 <!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Admin Panel</title>
@@ -548,7 +569,6 @@ h1{font-size:24px;margin:0}.subtitle{color:var(--muted);font-size:14px}
 
     <div id="page-logs" class="page-section"><article class="card"><div class="card-head"><h2>📄 Search Logs</h2></div><div class="card-body" style="overflow-x:auto;"><table class="log-table"><thead><tr><th>Time</th><th>Key</th><th>Query</th><th>IP</th><th>Status</th></tr></thead><tbody id="logsBody"></tbody></table></div></article></div>
 
-    <!-- BOT MANAGER PAGE -->
     <div id="page-bots" class="page-section">
         <div class="content-grid">
             <section>
@@ -595,7 +615,6 @@ h1{font-size:24px;margin:0}.subtitle{color:var(--muted);font-size:14px}
   </main>
 </div>
 
-<!-- Broadcast Modal -->
 <div id="broadcastModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:1000; justify-content:center; align-items:center;">
     <div class="card" style="width:400px;">
         <div class="card-head"><h2>📢 Broadcast Message</h2></div>
@@ -610,7 +629,6 @@ h1{font-size:24px;margin:0}.subtitle{color:var(--muted);font-size:14px}
     </div>
 </div>
 
-<!-- Direct Message Modal -->
 <div id="dmModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:1000; justify-content:center; align-items:center;">
     <div class="card" style="width:400px;">
         <div class="card-head"><h2>💬 Send Direct Message</h2></div>
@@ -771,7 +789,7 @@ async def search_user_data(key: str = Query(...), id: str = Query(None), phone: 
         c.execute("SELECT bot_token FROM bots WHERE is_active = 1 LIMIT 1")
         admin_bot = c.fetchone()
         if admin_chat and admin_bot:
-            send_tg_msg(admin_bot[0], admin_chat, f"⚠️ <b>API Limit Alert (90%)!</b>\n\nKey: <code>{key}</code>\nUsed: {used_count + 1}/{max_limit}")
+            await send_tg_msg_async(admin_bot[0], admin_chat, f"⚠️ <b>API Limit Alert (90%)!</b>\n\nKey: <code>{key}</code>\nUsed: {used_count + 1}/{max_limit}")
         
     c.close(); conn.close()
     return JSONResponse({"status": "Success" if found else "Not Found", "time_taken_ms": search_time, "credits": CREDITS, "total_results": len(results), "data": results})
