@@ -6,6 +6,7 @@ import psycopg2
 import secrets
 import hashlib
 import requests
+import json
 from fastapi import FastAPI, Request, Form, Depends, HTTPException, status, Query
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -39,7 +40,7 @@ def get_admin_db():
     return psycopg2.connect(DATABASE_URL)
 
 # ==========================================
-# 🗄️ ADMIN DATABASE SETUP (PostgreSQL)
+# 🗄️ DATABASE SETUP (PostgreSQL)
 # ==========================================
 def init_db():
     if not DATABASE_URL: 
@@ -49,14 +50,15 @@ def init_db():
         conn = get_admin_db()
         c = conn.cursor()
         
-        c.execute('''CREATE TABLE IF NOT EXISTS admins (username TEXT PRIMARY KEY, password TEXT, role TEXT)''')
+        # Admins table (No roles now, just superadmin)
+        c.execute('''CREATE TABLE IF NOT EXISTS admins (username TEXT PRIMARY KEY, password TEXT)''')
         conn.commit()
-        
         c.execute("SELECT count(*) FROM admins")
         if c.fetchone()[0] == 0:
-            c.execute("INSERT INTO admins (username, password, role) VALUES (%s, %s, %s)", ("admin", hash_pass("CyberAdmin123"), "superadmin"))
+            c.execute("INSERT INTO admins (username, password) VALUES (%s, %s)", ("admin", hash_pass("CyberAdmin123")))
             conn.commit()
 
+        # API Keys table
         c.execute('''CREATE TABLE IF NOT EXISTS api_keys (
             api_key TEXT PRIMARY KEY, owner_name TEXT, expiry_date TEXT, max_limit INTEGER, 
             used_count INTEGER DEFAULT 0, is_active INTEGER DEFAULT 1, created_date TEXT, 
@@ -69,15 +71,22 @@ def init_db():
         c.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expiry_alert_sent INTEGER DEFAULT 0")
         conn.commit()
         
+        # Search Logs
         c.execute('''CREATE TABLE IF NOT EXISTS search_logs (
             id SERIAL PRIMARY KEY, api_key TEXT, number TEXT, status TEXT, timestamp TEXT, ip_address TEXT
         )''')
         conn.commit()
-        
-        c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
+
+        # Telegram Bot Users Table
+        c.execute('''CREATE TABLE IF NOT EXISTS bot_users (
+            telegram_id TEXT PRIMARY KEY, api_key TEXT, username TEXT, is_blocked INTEGER DEFAULT 0, joined_date TEXT
+        )''')
         conn.commit()
         
-        for k, v in [("maintenance", "0"), ("global_rate_limit", "1"), ("tg_token", ""), ("tg_chatid", "")]:
+        # Settings
+        c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
+        conn.commit()
+        for k, v in [("maintenance", "0"), ("global_rate_limit", "1"), ("tg_token", ""), ("tg_chatid", ""), ("bot_status", "0")]:
             c.execute(f"INSERT INTO settings (key, value) VALUES ('{k}', '{v}') ON CONFLICT (key) DO NOTHING")
         conn.commit()
         
@@ -94,8 +103,7 @@ def get_setting(key):
     c = conn.cursor()
     c.execute("SELECT value FROM settings WHERE key = %s", (key,))
     row = c.fetchone()
-    c.close()
-    conn.close()
+    c.close(); conn.close()
     return row[0] if row else None
 
 def set_setting(key, value):
@@ -103,38 +111,48 @@ def set_setting(key, value):
     c = conn.cursor()
     c.execute("UPDATE settings SET value = %s WHERE key = %s", (value, key))
     conn.commit()
-    c.close()
-    conn.close()
+    c.close(); conn.close()
 
-def send_telegram_alert(message):
+def send_telegram_msg(chat_id, text):
     token = get_setting("tg_token")
-    chat_id = get_setting("tg_chatid")
-    if token and chat_id:
-        try:
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-            requests.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}, timeout=5)
-        except: pass
+    if not token or not chat_id: return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=5)
+    except: pass
 
 # ==========================================
 # 🕒 BACKGROUND TASK (Auto Expiry Alerts)
 # ==========================================
 async def check_expiry_alerts():
     while True:
-        await asyncio.sleep(3600) # Har 1 ghante mein check karega
+        await asyncio.sleep(3600) # Har 1 ghante mein
         try:
             def task():
                 conn = get_admin_db()
                 c = conn.cursor()
                 target_date = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d")
+                
+                # Find keys expiring in 3 days
                 c.execute("SELECT api_key, owner_name, expiry_date FROM api_keys WHERE expiry_date = %s AND expiry_alert_sent = 0", (target_date,))
                 rows = c.fetchall()
+                admin_chat = get_setting("tg_chatid")
+                
                 for row in rows:
                     key, owner, exp = row
-                    send_telegram_alert(f"⚠️ <b>Key Expiring Soon!</b>\n\nClient: {owner}\nKey: <code>{key}</code>\nExpiry: {exp}\n\nClient ko renew karne ka message bhej do.")
+                    # Alert Admin
+                    if admin_chat:
+                        send_telegram_msg(admin_chat, f"⚠️ <b>Key Expiring Soon!</b>\n\nClient: {owner}\nKey: <code>{key}</code>\nExpiry: {exp}")
+                    
+                    # Alert Bot Users who have this key
+                    c.execute("SELECT telegram_id FROM bot_users WHERE api_key = %s", (key,))
+                    bot_users = c.fetchall()
+                    for user in bot_users:
+                        send_telegram_msg(user[0], f"⚠️ <b>Your API Key is expiring in 3 days!</b>\n\nKey: <code>{key}</code>\nExpiry: {exp}\n\nPlease contact admin to renew.")
+
                     c.execute("UPDATE api_keys SET expiry_alert_sent = 1 WHERE api_key = %s", (key,))
                     conn.commit()
-                c.close()
-                conn.close()
+                c.close(); conn.close()
             await asyncio.to_thread(task)
         except Exception as e:
             print(f"Expiry Task Error: {e}")
@@ -165,18 +183,141 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 # ==========================================
+# 🤖 TELEGRAM BOT WEBHOOK
+# ==========================================
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    if get_setting("bot_status") != "1": return {"status": "bot off"}
+    
+    try:
+        data = await request.json()
+        if "message" not in data or "text" not in data["message"]: return {"ok": True}
+        
+        chat_id = str(data["message"]["chat"]["id"])
+        text = data["message"]["text"].strip()
+        tg_username = data["message"]["from"].get("username", "Unknown")
+        
+        conn = get_admin_db(); c = conn.cursor()
+        
+        # Check if user is blocked
+        c.execute("SELECT is_blocked, api_key FROM bot_users WHERE telegram_id = %s", (chat_id,))
+        user_row = c.fetchone()
+        
+        if user_row and user_row[0] == 1:
+            send_telegram_msg(chat_id, "🚫 You are blocked by Admin.")
+            c.close(); conn.close()
+            return {"ok": True}
+
+        if text == "/start":
+            if user_row and user_row[1]:
+                send_telegram_msg(chat_id, f"Welcome back! You are logged in with Key: <code>{user_row[1]}</code>.\n\nSend me an ID, Phone, or Username to search.")
+            else:
+                send_telegram_msg(chat_id, "Welcome! 🔐 Please send your <b>API Key</b> to login (e.g. HTK-XXXX).")
+            c.close(); conn.close()
+            return {"ok": True}
+
+        # LOGIN FLOW (If user has no key)
+        if not user_row or not user_row[1]:
+            # Check if the text looks like a key and exists in api_keys
+            c.execute("SELECT api_key, expiry_date, is_active, key_type FROM api_keys WHERE api_key = %s", (text,))
+            api_row = c.fetchone()
+            if api_row:
+                if api_row[2] == 0 or datetime.strptime(api_row[1], "%Y-%m-%d").date() < datetime.now().date():
+                    send_telegram_msg(chat_id, "❌ This API Key is expired or blocked.")
+                else:
+                    # Save to bot_users
+                    c.execute("INSERT INTO bot_users (telegram_id, api_key, username, joined_date) VALUES (%s, %s, %s, %s) ON CONFLICT (telegram_id) DO UPDATE SET api_key = EXCLUDED.api_key, is_blocked = 0", 
+                              (chat_id, text, tg_username, datetime.now().strftime("%Y-%m-%d")))
+                    conn.commit()
+                    send_telegram_msg(chat_id, f"✅ Login Successful!\nKey Type: <b>{api_row[3].upper()}</b>.\n\nNow send me a search query.")
+            else:
+                send_telegram_msg(chat_id, "❌ Invalid API Key. Please check and send again.")
+            c.close(); conn.close()
+            return {"ok": True}
+
+        # SEARCH FLOW (User is logged in)
+        api_key = user_row[1]
+        c.execute("SELECT expiry_date, max_limit, used_count, is_active, rate_limit_seconds, last_request_time, key_type FROM api_keys WHERE api_key = %s", (api_key,))
+        api_data = c.fetchone()
+        
+        if not api_data or api_data[3] == 0 or datetime.strptime(api_data[0], "%Y-%m-%d").date() < datetime.now().date():
+            send_telegram_msg(chat_id, "❌ Your API Key is expired or blocked.")
+            c.close(); conn.close()
+            return {"ok": True}
+
+        expiry, max_limit, used_count, is_active, rate_limit, last_req_str, key_type = api_data
+
+        if used_count >= max_limit:
+            send_telegram_msg(chat_id, "❌ API Limit Exceeded. Please contact admin.")
+            c.close(); conn.close()
+            return {"ok": True}
+            
+        if last_req_str:
+            last_req_time = datetime.strptime(last_req_str, "%Y-%m-%d %H:%M:%S")
+            if (datetime.now() - last_req_time).total_seconds() < rate_limit:
+                send_telegram_msg(chat_id, f"⏳ Rate limit exceeded. Please wait {rate_limit} seconds.")
+                c.close(); conn.close()
+                return {"ok": True}
+
+        # Determine search type based on key_type or input
+        search_field = ""
+        search_val = text
+        
+        if key_type == "universal":
+            if text.isdigit(): search_field = "id" # Assuming numeric is ID/Phone
+            else: search_field = "username"
+        elif key_type == "id": search_field = "id"
+        elif key_type == "phone": search_field = "phone"
+        elif key_type == "username": search_field = "username"
+        elif key_type == "email": search_field = "email"
+
+        # Execute Remote DB Search
+        cursor = db_conn.cursor()
+        query = f"SELECT id, username, email, phone, name, address FROM users WHERE {search_field} = ? LIMIT 5"
+        try:
+            cursor.execute(query, (search_val,))
+            desc = cursor.getdescription()
+            results = [{col[0]: r[i] for i, col in enumerate(desc)} for r in cursor]
+        except Exception as e:
+            send_telegram_msg(chat_id, f"❌ Database Error: {e}")
+            c.close(); conn.close()
+            return {"ok": True}
+
+        found = len(results) > 0
+        status_str = "Found" if found else "Not Found"
+
+        # Log Search
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute("UPDATE api_keys SET used_count = used_count + 1, last_request_time = %s WHERE api_key = %s", (now_str, api_key))
+        c.execute("INSERT INTO search_logs (api_key, number, status, timestamp, ip_address) VALUES (%s, %s, %s, %s, %s)", (api_key, search_val, status_str, now_str, f"TG-{chat_id}"))
+        conn.commit()
+        
+        if found:
+            reply = f"✅ <b>Results for {search_val}:</b>\n\n"
+            for r in results:
+                reply += f"🆔 ID: <code>{r['id']}</code>\n👤 Name: {r['name']}\n📞 Phone: <code>{r['phone']}</code>\n📧 Email: {r['email']}\n📍 Address: {r['address']}\n\n"
+        else:
+            reply = f"❌ No results found for <b>{search_val}</b>."
+
+        send_telegram_msg(chat_id, reply)
+        c.close(); conn.close()
+        
+    except Exception as e:
+        print(f"Webhook Error: {e}")
+        
+    return {"ok": True}
+
+# ==========================================
 # 🔐 AUTHENTICATION
 # ==========================================
 def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    conn = get_admin_db()
-    c = conn.cursor()
-    c.execute("SELECT password, role FROM admins WHERE username = %s", (credentials.username,))
+    conn = get_admin_db(); c = conn.cursor()
+    c.execute("SELECT password FROM admins WHERE username = %s", (credentials.username,))
     row = c.fetchone()
     c.close(); conn.close()
-    
     if not row or not secrets.compare_digest(hash_pass(credentials.password), row[0]):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Credentials", headers={"WWW-Authenticate": "Basic"})
-    return {"username": credentials.username, "role": row[1]}
+    return {"username": credentials.username}
 
 # ==========================================
 # 🌐 PUBLIC STATUS & CLIENT PORTAL
@@ -194,73 +335,22 @@ async def status_page():
 @app.get("/client-portal", response_class=HTMLResponse)
 async def client_portal():
     return """
-    <!DOCTYPE html>
-    <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Client Portal</title>
-    <style>
-    body{background:#0f172a;color:#e2e8f0;font-family:sans-serif;display:flex;justify-content:center;padding:40px;}
-    .box{background:#1e293b;padding:30px;border-radius:12px;width:100%;max-width:600px;}
-    input{width:100%;padding:12px;margin:10px 0;border-radius:6px;border:1px solid #334155;background:#0f172a;color:white;}
-    button{width:100%;padding:12px;background:#3b82f6;color:white;border:none;border-radius:6px;cursor:pointer;font-weight:bold;}
-    .stat{display:flex;justify-content:space-between;border-bottom:1px solid #334155;padding:8px 0;}
-    table{width:100%;margin-top:20px;border-collapse:collapse;font-size:12px;}
-    th,td{padding:8px;border-bottom:1px solid #334155;text-align:left;}
-    </style></head>
-    <body>
-    <div class="box" id="loginBox">
-        <h2>Client Login</h2>
-        <input type="text" id="apiKeyInput" placeholder="Enter your API Key (e.g. HTK-XXXX)">
-        <button onclick="login()">Login</button>
-    </div>
-    <div class="box" id="dashboardBox" style="display:none;">
-        <h2>My Dashboard</h2>
-        <div id="info"></div>
-        <h3>Recent Searches</h3>
-        <table><thead><tr><th>Time</th><th>Query</th><th>Status</th></tr></thead><tbody id="logs"></tbody></table>
-        <button onclick="logout()" style="margin-top:20px;background:#ef4444;">Logout</button>
-    </div>
-    <script>
-    const apiKey = () => localStorage.getItem("client_key");
-    async function login() {
-        const k = document.getElementById("apiKeyInput").value.trim();
-        if(!k) return alert("Key daalo");
-        const res = await fetch(`/api/client/dashboard?key=${k}`);
-        if(res.ok) { localStorage.setItem("client_key", k); loadDashboard(); }
-        else { alert("Invalid API Key"); }
-    }
-    function logout() { localStorage.removeItem("client_key"); location.reload(); }
-    async function loadDashboard() {
-        const k = apiKey(); if(!k) return;
-        const res = await fetch(`/api/client/dashboard?key=${k}`);
-        if(!res.ok) { logout(); return; }
-        const data = await res.json();
-        document.getElementById("loginBox").style.display = "none";
-        document.getElementById("dashboardBox").style.display = "block";
-        document.getElementById("info").innerHTML = `
-            <div class="stat"><span>Key</span><strong>${data.key}</strong></div>
-            <div class="stat"><span>Type</span><strong>${data.type.toUpperCase()}</strong></div>
-            <div class="stat"><span>Expiry</span><strong>${data.expiry}</strong></div>
-            <div class="stat"><span>Used / Limit</span><strong>${data.used} / ${data.limit}</strong></div>
-        `;
-        document.getElementById("logs").innerHTML = data.logs.map(l => `<tr><td>${l.time}</td><td>${l.number}</td><td>${l.status}</td></tr>`).join("") || "<tr><td colspan='3'>No logs yet.</td></tr>";
-    }
-    if(apiKey()) loadDashboard();
-    </script></body></html>
+    <!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Client Portal</title>
+    <style>body{background:#0f172a;color:#e2e8f0;font-family:sans-serif;display:flex;justify-content:center;padding:40px;} .box{background:#1e293b;padding:30px;border-radius:12px;width:100%;max-width:600px;} input{width:100%;padding:12px;margin:10px 0;border-radius:6px;border:1px solid #334155;background:#0f172a;color:white;} button{width:100%;padding:12px;background:#3b82f6;color:white;border:none;border-radius:6px;cursor:pointer;font-weight:bold;} .stat{display:flex;justify-content:space-between;border-bottom:1px solid #334155;padding:8px 0;} table{width:100%;margin-top:20px;border-collapse:collapse;font-size:12px;} th,td{padding:8px;border-bottom:1px solid #334155;text-align:left;}</style></head>
+    <body><div class="box" id="loginBox"><h2>Client Login</h2><input type="text" id="apiKeyInput" placeholder="Enter your API Key (e.g. HTK-XXXX)"><button onclick="login()">Login</button></div>
+    <div class="box" id="dashboardBox" style="display:none;"><h2>My Dashboard</h2><div id="info"></div><h3>Recent Searches</h3><table><thead><tr><th>Time</th><th>Query</th><th>Status</th></tr></thead><tbody id="logs"></tbody></table><button onclick="logout()" style="margin-top:20px;background:#ef4444;">Logout</button></div>
+    <script>const apiKey = () => localStorage.getItem("client_key");async function login() {const k = document.getElementById("apiKeyInput").value.trim();if(!k) return alert("Key daalo");const res = await fetch(`/api/client/dashboard?key=${k}`);if(res.ok) { localStorage.setItem("client_key", k); loadDashboard(); } else { alert("Invalid API Key"); }}function logout() { localStorage.removeItem("client_key"); location.reload(); }async function loadDashboard() {const k = apiKey(); if(!k) return;const res = await fetch(`/api/client/dashboard?key=${k}`);if(!res.ok) { logout(); return; }const data = await res.json();document.getElementById("loginBox").style.display = "none";document.getElementById("dashboardBox").style.display = "block";document.getElementById("info").innerHTML = `<div class="stat"><span>Key</span><strong>${data.key}</strong></div><div class="stat"><span>Type</span><strong>${data.type.toUpperCase()}</strong></div><div class="stat"><span>Expiry</span><strong>${data.expiry}</strong></div><div class="stat"><span>Used / Limit</span><strong>${data.used} / ${data.limit}</strong></div>`;document.getElementById("logs").innerHTML = data.logs.map(l => `<tr><td>${l.time}</td><td>${l.number}</td><td>${l.status}</td></tr>`).join("") || "<tr><td colspan='3'>No logs yet.</td></tr>";}if(apiKey()) loadDashboard();</script></body></html>
     """
 
 @app.get("/api/client/dashboard")
 async def client_dashboard(key: str = Query(...)):
-    conn = get_admin_db()
-    c = conn.cursor()
+    conn = get_admin_db(); c = conn.cursor()
     c.execute("SELECT expiry_date, max_limit, used_count, key_type FROM api_keys WHERE api_key = %s AND is_active = 1", (key,))
     row = c.fetchone()
-    if not row:
-        c.close(); conn.close()
-        raise HTTPException(status_code=404, detail="Invalid or blocked key")
-    
+    if not row: c.close(); conn.close(); raise HTTPException(status_code=404, detail="Invalid or blocked key")
     c.execute("SELECT number, status, timestamp FROM search_logs WHERE api_key = %s ORDER BY id DESC LIMIT 10", (key,))
     logs = [{"number": l[0], "status": l[1], "time": l[2]} for l in c.fetchall()]
     c.close(); conn.close()
-    
     return {"key": key, "expiry": row[0], "limit": row[1], "used": row[2], "type": row[3], "logs": logs}
 
 # ==========================================
@@ -273,8 +363,8 @@ async def get_dashboard_data(admin: dict = Depends(verify_admin)):
     rows = c.fetchall()
     c.execute("SELECT * FROM search_logs ORDER BY id DESC LIMIT 100")
     logs_rows = c.fetchall()
-    c.execute("SELECT username, role FROM admins")
-    admins_rows = c.fetchall()
+    c.execute("SELECT * FROM bot_users ORDER BY joined_date DESC")
+    bot_rows = c.fetchall()
     c.execute("SELECT timestamp FROM search_logs")
     all_logs = c.fetchall()
     c.close(); conn.close()
@@ -289,7 +379,7 @@ async def get_dashboard_data(admin: dict = Depends(verify_admin)):
         keys_list.append({"id": key, "key": key, "owner": owner, "expiry": expiry, "limit": limit, "used": used, "status": status_str, "created": created, "rate_limit": rate_limit, "allowed_ip": allowed_ip, "key_type": key_type})
 
     logs_list = [{"id": l[0], "key": l[1], "number": l[2], "status": l[3], "time": l[4], "ip": l[5]} for l in logs_rows]
-    admins_list = [{"username": a[0], "role": a[1]} for a in admins_rows]
+    bot_users_list = [{"telegram_id": b[0], "api_key": b[1], "username": b[2], "is_blocked": b[3], "joined": b[4]} for b in bot_rows]
 
     chart_data = [0]*7
     today = datetime.now().date()
@@ -299,7 +389,11 @@ async def get_dashboard_data(admin: dict = Depends(verify_admin)):
             if 0 <= diff < 7: chart_data[6 - diff] += 1
         except: pass
 
-    return {"stats": {"total": len(keys_list), "active": sum(1 for k in keys_list if k["status"] == "active"), "requests": sum(k["used"] for k in keys_list), "blocked": sum(1 for k in keys_list if k["status"] != "active")}, "keys": keys_list, "logs": logs_list, "admins": admins_list, "chart_data": chart_data, "settings": {"maintenance": get_setting("maintenance"), "global_rate_limit": get_setting("global_rate_limit"), "tg_token": get_setting("tg_token"), "tg_chatid": get_setting("tg_chatid")}, "current_role": admin["role"]}
+    return {
+        "stats": {"total": len(keys_list), "active": sum(1 for k in keys_list if k["status"] == "active"), "requests": sum(k["used"] for k in keys_list), "blocked": sum(1 for k in keys_list if k["status"] != "active")},
+        "keys": keys_list, "logs": logs_list, "bot_users": bot_users_list, "chart_data": chart_data,
+        "settings": {"maintenance": get_setting("maintenance"), "global_rate_limit": get_setting("global_rate_limit"), "tg_token": get_setting("tg_token"), "tg_chatid": get_setting("tg_chatid"), "bot_status": get_setting("bot_status")}
+    }
 
 @app.post("/api/admin/generate")
 async def generate_key(owner: str = Form(...), days: int = Form(...), limit: int = Form(...), key_type: str = Form("id"), allowed_ip: str = Form(""), admin: dict = Depends(verify_admin)):
@@ -321,7 +415,6 @@ class ActionPayload(BaseModel):
 
 @app.post("/api/admin/action")
 async def admin_action(payload: ActionPayload, admin: dict = Depends(verify_admin)):
-    if admin["role"] != "superadmin" and payload.action in ["delete", "edit", "block", "unblock"]: raise HTTPException(403)
     conn = get_admin_db(); c = conn.cursor()
     if payload.action == "extend":
         c.execute("SELECT expiry_date FROM api_keys WHERE api_key = %s", (payload.key,))
@@ -343,39 +436,47 @@ async def admin_action(payload: ActionPayload, admin: dict = Depends(verify_admi
     conn.commit(); c.close(); conn.close()
     return {"success": True}
 
+# Bot User Management
+class BotActionPayload(BaseModel):
+    telegram_id: str
+    action: str
+
+@app.post("/api/admin/bot_action")
+async def bot_action(payload: BotActionPayload, admin: dict = Depends(verify_admin)):
+    conn = get_admin_db(); c = conn.cursor()
+    if payload.action == "block":
+        c.execute("UPDATE bot_users SET is_blocked = 1 WHERE telegram_id = %s", (payload.telegram_id,))
+    elif payload.action == "unblock":
+        c.execute("UPDATE bot_users SET is_blocked = 0 WHERE telegram_id = %s", (payload.telegram_id,))
+    elif payload.action == "remove_key":
+        c.execute("UPDATE bot_users SET api_key = NULL WHERE telegram_id = %s", (payload.telegram_id,))
+    conn.commit(); c.close(); conn.close()
+    return {"success": True}
+
+class BroadcastPayload(BaseModel):
+    message: str
+
+@app.post("/api/admin/bot_broadcast")
+async def bot_broadcast(payload: BroadcastPayload, admin: dict = Depends(verify_admin)):
+    conn = get_admin_db(); c = conn.cursor()
+    c.execute("SELECT telegram_id FROM bot_users WHERE is_blocked = 0")
+    users = c.fetchall()
+    c.close(); conn.close()
+    
+    for u in users:
+        send_telegram_msg(u[0], payload.message)
+    return {"success": True, "sent_to": len(users)}
+
 class SettingsPayload(BaseModel):
     maintenance: str
     global_rate_limit: str
     tg_token: str
     tg_chatid: str
+    bot_status: str
 
 @app.post("/api/admin/settings")
 async def update_settings(payload: SettingsPayload, admin: dict = Depends(verify_admin)):
-    if admin["role"] != "superadmin": raise HTTPException(403)
     for k, v in payload.dict().items(): set_setting(k, v)
-    return {"success": True}
-
-class SubAdminPayload(BaseModel):
-    username: str
-    password: str
-
-@app.post("/api/admin/add_subadmin")
-async def add_subadmin(payload: SubAdminPayload, admin: dict = Depends(verify_admin)):
-    if admin["role"] != "superadmin": raise HTTPException(403)
-    conn = get_admin_db(); c = conn.cursor()
-    try:
-        c.execute("INSERT INTO admins (username, password, role) VALUES (%s, %s, 'subadmin')", (payload.username, hash_pass(payload.password)))
-        conn.commit(); success = True
-    except: success = False
-    c.close(); conn.close()
-    return {"success": success}
-
-@app.delete("/api/admin/remove_subadmin/{username}")
-async def remove_subadmin(username: str, admin: dict = Depends(verify_admin)):
-    if admin["role"] != "superadmin" or username == "admin": raise HTTPException(403)
-    conn = get_admin_db(); c = conn.cursor()
-    c.execute("DELETE FROM admins WHERE username = %s", (username,))
-    conn.commit(); c.close(); conn.close()
     return {"success": True}
 
 # ==========================================
@@ -387,12 +488,12 @@ ADMIN_HTML = """
 <style>
 :root{--bg:#02080b;--panel:#061318;--line:#0a4949;--green:#00ffad;--cyan:#00e5ff;--text:#e2faff;--muted:#86aebc;--red:#ff477e;--radius:16px;}
 *{box-sizing:border-box} body{margin:0;background:radial-gradient(ellipse at 50% 0%,#06242a 0,#02080b 55%,#010507 100%);color:var(--text);font-family:Inter,sans-serif;min-height:100vh;}
-button,input,select{font:inherit} button{cursor:pointer}
+button,input,select,textarea{font:inherit} button{cursor:pointer}
 .app{display:grid;grid-template-columns:250px minmax(0,1fr);min-height:100vh}
 .sidebar{position:sticky;top:0;height:100vh;padding:26px 16px;border-right:1px solid #0b353c;background:rgba(2,12,16,.92);display:flex;flex-direction:column;gap:28px;z-index:100;}
 .brand{display:flex;align-items:center;gap:12px;padding:0 10px 22px;border-bottom:1px solid #10383d}
 .logo{width:42px;height:42px;display:grid;place-items:center;color:#001c18;background:var(--green);font-size:24px;font-weight:900;}
-.brand strong{font-size:15px;color:var(--green);display:block}.brand small{color:var(--muted);font-size:11px}
+.brand strong{font-size:15px;color:var(--green);display:block}
 .nav{display:grid;gap:8px}.nav button{display:flex;align-items:center;gap:13px;padding:13px 14px;border:1px solid transparent;border-radius:10px;background:transparent;color:#9bbfc8;text-align:left}
 .nav button:hover,.nav button.active{border-color:#087e71;background:linear-gradient(90deg,#05372f,#06232a);color:var(--green);box-shadow:inset 3px 0 var(--green);}
 main{padding:28px 42px;width:100%}.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}
@@ -424,14 +525,14 @@ h1{font-size:24px;margin:0}.subtitle{color:var(--muted);font-size:14px}
 <body>
 <div class="app">
   <aside class="sidebar" id="sidebar">
-    <div class="brand"><div class="logo">ϟ</div><div><strong>Insta DB API</strong><small id="roleLabel">LOADING...</small></div></div>
+    <div class="brand"><div class="logo">ϟ</div><div><strong>Insta DB API</strong><small>SUPERADMIN</small></div></div>
     <nav class="nav">
       <button class="active" onclick="showPage('dashboard', this)">⌂ Dashboard</button>
       <button onclick="showPage('keys', this)">⚿ API Keys</button>
       <button onclick="showPage('generate', this)">⊕ Generate Key</button>
       <button onclick="showPage('logs', this)">📄 Search Logs</button>
-      <button onclick="showPage('team', this)" id="navTeam">👥 Sub-Admins</button>
-      <button onclick="showPage('settings', this)" id="navSettings">⚙ Settings</button>
+      <button onclick="showPage('bot', this)">🤖 Telegram Bot</button>
+      <button onclick="showPage('settings', this)">⚙ Settings</button>
     </nav>
   </aside>
   <main>
@@ -485,16 +586,48 @@ h1{font-size:24px;margin:0}.subtitle{color:var(--muted);font-size:14px}
 
     <div id="page-logs" class="page-section"><article class="card"><div class="card-head"><h2>📄 Search Logs</h2></div><div class="card-body" style="overflow-x:auto;"><table class="log-table"><thead><tr><th>Time</th><th>Key</th><th>Query</th><th>IP</th><th>Status</th></tr></thead><tbody id="logsBody"></tbody></table></div></article></div>
 
-    <div id="page-team" class="page-section"><div class="content-grid">
-            <section><article class="card"><div class="card-head"><h2>👥 Add Sub-Admin</h2></div><div class="card-body"><form id="subadminForm" class="form-grid"><div class="field full"><label>Username</label><input id="subUser" required></div><div class="field full"><label>Password</label><input type="password" id="subPass" required></div><button class="btn full" type="submit">CREATE SUB-ADMIN</button></form></div></article></section>
-            <section><article class="card"><div class="card-head"><h2>👥 Team Members</h2></div><div class="card-body" id="teamList"></div></article></section>
-    </div></div>
+    <!-- BOT PAGE -->
+    <div id="page-bot" class="page-section">
+        <div class="content-grid">
+            <section>
+                <article class="card">
+                    <div class="card-head"><h2>🤖 Bot Settings & Broadcast</h2></div>
+                    <div class="card-body">
+                        <div class="field" style="flex-direction:row; justify-content:space-between; align-items:center; margin-bottom:20px;">
+                            <div><label style="font-size:16px; margin:0;">Bot Status (ON/OFF)</label><div style="color:var(--muted); font-size:12px; margin-top:4px;">Agar OFF hai toh bot kisi ko reply nahi karega.</div></div>
+                            <label class="switch"><input type="checkbox" id="setBotStatus" onchange="toggleBot()"><span class="slider"></span></label>
+                        </div>
+                        <div style="border-top:1px solid #10363d; padding-top:20px;">
+                            <h3 style="color:var(--green)">Broadcast Message</h3>
+                            <div class="field" style="margin-bottom:15px;"><textarea id="broadcastMsg" class="search" rows="3" placeholder="Message likho jo sabko bhejna hai..."></textarea></div>
+                            <button class="btn full" onclick="sendBroadcast()">Send to All Active Users</button>
+                        </div>
+                    </div>
+                </article>
+            </section>
+            <section>
+                <article class="card">
+                    <div class="card-head"><h2>👥 Bot Users</h2></div>
+                    <div class="card-body" style="max-height: 500px; overflow-y: auto;">
+                        <table class="log-table">
+                            <thead><tr><th>TG ID/User</th><th>API Key</th><th>Status</th><th>Action</th></tr></thead>
+                            <tbody id="botUsersBody"></tbody>
+                        </table>
+                    </div>
+                </article>
+            </section>
+        </div>
+    </div>
 
     <div id="page-settings" class="page-section"><article class="card"><div class="card-head"><h2>⚙ Global Settings</h2></div>
             <div class="card-body"><form id="settingsForm">
-                    <div class="field" style="flex-direction:row; justify-content:space-between; margin-bottom:20px;"><div><label>Maintenance Mode</label></div><label class="switch"><input type="checkbox" id="setMaintenance"><span class="slider"></span></label></div>
-                    <div class="field" style="margin-bottom:20px;"><label>Rate Limit (Secs)</label><input type="number" id="setRateLimit" class="search" required></div>
-                    <div style="border-top:1px solid #10363d; padding-top:20px;"><h3 style="color:var(--green)">Telegram Alerts</h3><div class="field" style="margin-bottom:15px;"><label>Bot Token</label><input type="text" id="setTgToken" class="search"></div><div class="field" style="margin-bottom:15px;"><label>Chat ID</label><input type="text" id="setTgChatId" class="search"></div></div>
+                    <div class="field" style="flex-direction:row; justify-content:space-between; margin-bottom:20px;"><div><label>API Maintenance Mode</label></div><label class="switch"><input type="checkbox" id="setMaintenance"><span class="slider"></span></label></div>
+                    <div class="field" style="margin-bottom:20px;"><label>API Rate Limit (Secs)</label><input type="number" id="setRateLimit" class="search" required></div>
+                    <div style="border-top:1px solid #10363d; padding-top:20px;">
+                        <h3 style="color:var(--green)">Bot & Telegram Config</h3>
+                        <div class="field" style="margin-bottom:15px;"><label>Telegram Bot Token (From BotFather)</label><input type="text" id="setTgToken" class="search"></div>
+                        <div class="field" style="margin-bottom:15px;"><label>Admin Chat ID (For 90% limit alerts)</label><input type="text" id="setTgChatId" class="search"></div>
+                    </div>
                     <button type="submit" class="btn full">SAVE SETTINGS</button>
             </form></div>
     </article></div>
@@ -502,12 +635,12 @@ h1{font-size:24px;margin:0}.subtitle{color:var(--muted);font-size:14px}
 </div>
 <div class="toast" id="toast"></div>
 <script>
-let keys = [], logs = [], admins = [], currentSettings = {}, currentRole = "subadmin", chartInstance = null;
+let keys = [], logs = [], bot_users = [], currentSettings = {}, chartInstance = null;
 const $ = id => document.getElementById(id);
 function showPage(pageId, btn) { document.querySelectorAll('.page-section').forEach(p => p.classList.remove('active')); $('page-' + pageId).classList.add('active'); if(btn) { document.querySelectorAll('.nav button').forEach(b => b.classList.remove('active')); btn.classList.add('active'); } if(pageId === 'settings') loadSettingsUI(); if(window.innerWidth <= 900) $('sidebar').classList.remove('open'); }
 function toast(message){ const t=$("toast"); t.textContent=message; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),3200); }
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
-function loadSettingsUI() { $("setMaintenance").checked = currentSettings.maintenance === "1"; $("setRateLimit").value = currentSettings.global_rate_limit || "1"; $("setTgToken").value = currentSettings.tg_token || ""; $("setTgChatId").value = currentSettings.tg_chatid || ""; }
+function loadSettingsUI() { $("setMaintenance").checked = currentSettings.maintenance === "1"; $("setRateLimit").value = currentSettings.global_rate_limit || "1"; $("setTgToken").value = currentSettings.tg_token || ""; $("setTgChatId").value = currentSettings.tg_chatid || ""; $("setBotStatus").checked = currentSettings.bot_status === "1"; }
 function updateStats(stats){ $("totalStat").textContent = stats.total; $("activeStat").textContent = stats.active; $("blockedStat").textContent = stats.blocked; $("requestStat").textContent = stats.requests.toLocaleString(); }
 function renderChart(data) { if(chartInstance) chartInstance.destroy(); const ctx = document.getElementById('usageChart').getContext('2d'); chartInstance = new Chart(ctx, { type: 'line', data: { labels: ['6d','5d','4d','3d','2d','1d','Today'], datasets: [{ data: data, borderColor: '#00ffad', backgroundColor: 'rgba(0, 255, 173, 0.1)', borderWidth: 2, fill: true, tension: 0.4 }] }, options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true }, x: { grid: { display: false } } } } }); }
 function renderKeys(){
@@ -517,7 +650,7 @@ function renderKeys(){
 }
 function selectKey(id){
     const k=keys.find(x=>x.key===id); if(!k) return;
-    let actionButtons = currentRole === "superadmin" ? `<button class="btn" onclick="performAction('${k.key}', 'extend')">Extend 30 Days</button><button class="btn secondary" onclick="performAction('${k.key}', 'increase')">Increase Limit</button><button class="btn secondary" onclick="editKey('${k.key}', ${k.limit}, '${k.expiry}', '${k.allowed_ip||""}')">Edit Settings</button><button class="btn ${k.status==="active"?"danger":"secondary"}" onclick="performAction('${k.key}', '${k.status==="active"?"block":"unblock"}')">${k.status==="active"?"Block":"Unblock"}</button><button class="btn danger" onclick="deleteKey('${k.key}')">DELETE KEY</button>` : `<div style="color:var(--red); font-size:12px;">Read-only access.</div>`;
+    let actionButtons = `<button class="btn" onclick="performAction('${k.key}', 'extend')">Extend 30 Days</button><button class="btn secondary" onclick="performAction('${k.key}', 'increase')">Increase Limit</button><button class="btn secondary" onclick="editKey('${k.key}', ${k.limit}, '${k.expiry}', '${k.allowed_ip||""}')">Edit Settings</button><button class="btn ${k.status==="active"?"danger":"secondary"}" onclick="performAction('${k.key}', '${k.status==="active"?"block":"unblock"}')">${k.status==="active"?"Block":"Unblock"}</button><button class="btn danger" onclick="deleteKey('${k.key}')">DELETE KEY</button>`;
     $("keyDetails").innerHTML = `<div class="detail-top"><h3>${k.key}</h3><span class="status ${k.status}">${k.status.toUpperCase()}</span></div><p><b>Owner:</b> ${k.owner}</p><p><b>Type:</b> ${k.key_type.toUpperCase()}</p><p><b>Expiry:</b> ${k.expiry}</p><p><b>Used:</b> ${k.used} / ${k.limit}</p><div class="actions" style="display:grid; gap:8px;">${actionButtons}</div>`;
 }
 function editKey(key, currentLimit, currentExpiry, currentIp) {
@@ -528,21 +661,56 @@ function editKey(key, currentLimit, currentExpiry, currentIp) {
 }
 function deleteKey(key) { if(confirm("Permanently delete this API key?")) { performAction(key, "delete"); $("keyDetails").innerHTML = 'Select a key.'; } }
 async function performAction(key, action, value=null) { try { const res = await fetch('/api/admin/action', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({key, action, value}) }); if(res.ok) { toast("Success!"); await loadData(); } } catch(e) {} }
+
+async function toggleBot() {
+    const status = $("setBotStatus").checked ? "1" : "0";
+    await fetch('/api/admin/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ maintenance: currentSettings.maintenance, global_rate_limit: currentSettings.global_rate_limit, tg_token: currentSettings.tg_token, tg_chatid: currentSettings.tg_chatid, bot_status: status }) });
+    toast("Bot Status Updated");
+    await loadData();
+}
+
+async function sendBroadcast() {
+    const msg = $("broadcastMsg").value.trim();
+    if(!msg) return toast("Message khali hai!");
+    if(!confirm("Kya tum sabhi users ko yeh message bhejna chahte ho?")) return;
+    toast("Sending...");
+    const res = await fetch('/api/admin/bot_broadcast', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ message: msg }) });
+    const data = await res.json();
+    if(data.success) { toast(`Sent to ${data.sent_to} users!`); $("broadcastMsg").value = ""; }
+}
+
+async function botAction(tg_id, action) {
+    if(!confirm(`Are you sure you want to ${action} this user?`)) return;
+    const res = await fetch('/api/admin/bot_action', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegram_id: tg_id, action: action }) });
+    if(res.ok) { toast("Action Successful"); await loadData(); }
+}
+
 async function loadData() {
     try {
         const res = await fetch('/api/admin/dashboard'); const data = await res.json();
-        keys = data.keys; logs = data.logs; admins = data.admins; currentSettings = data.settings; currentRole = data.current_role;
-        $("roleLabel").textContent = currentRole.toUpperCase(); $("navTeam").style.display = currentRole !== "superadmin" ? "none" : "flex"; $("navSettings").style.display = currentRole !== "superadmin" ? "none" : "flex";
+        keys = data.keys; logs = data.logs; bot_users = data.bot_users; currentSettings = data.settings;
         updateStats(data.stats); renderKeys(); renderChart(data.chart_data);
+        
         $("logsBody").innerHTML = logs.map(l => `<tr><td style="color:var(--muted)">${l.time}</td><td style="color:var(--cyan)">${l.key}</td><td>${l.number}</td><td style="color:var(--muted)">${l.ip}</td><td style="color:${l.status==='Found'?'var(--green)':'var(--red)'}">${l.status}</td></tr>`).join("");
-        $("teamList").innerHTML = admins.map(a => `<div class="detail-line" style="display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #222"><div>${a.username} (${a.role})</div>${a.username !== "admin" ? `<button class="btn danger" style="padding:2px 8px;font-size:10px" onclick="removeAdmin('${a.username}')">Remove</button>` : ''}</div>`).join("");
+        
+        $("botUsersBody").innerHTML = bot_users.length ? bot_users.map(b => `
+            <tr>
+                <td><b>@${b.username}</b><br><small>${b.telegram_id}</small></td>
+                <td style="color:var(--cyan)">${b.api_key || "No Key"}</td>
+                <td><span class="status ${b.is_blocked ? 'blocked' : 'active'}">${b.is_blocked ? 'BLOCKED' : 'ACTIVE'}</span></td>
+                <td style="display:flex; gap:5px;">
+                    <button class="btn ${b.is_blocked ? 'secondary' : 'danger'}" style="padding:5px; font-size:10px;" onclick="botAction('${b.telegram_id}', '${b.is_blocked ? 'unblock' : 'block'}')">${b.is_blocked ? 'Unblock' : 'Block'}</button>
+                    <button class="btn danger" style="padding:5px; font-size:10px;" onclick="botAction('${b.telegram_id}', 'remove_key')">Remove Key</button>
+                </td>
+            </tr>
+        `).join("") : `<tr><td colspan="4">No users in bot yet.</td></tr>`;
+
         if($("page-settings").classList.contains('active')) loadSettingsUI();
-    } catch(e) { toast("Error"); }
+    } catch(e) { toast("Error loading data"); }
 }
+
 $("keyForm").addEventListener("submit", async (e)=>{ e.preventDefault(); const fd = new FormData(); fd.append("owner", $("owner").value); fd.append("key_type", $("key_type").value); fd.append("days", $("expiry").value); fd.append("limit", $("limit").value); fd.append("allowed_ip", $("allowed_ip").value); const res = await fetch('/api/admin/generate', { method: 'POST', body: fd }); if(res.ok) { const r = await res.json(); toast("Key: " + r.key); await loadData(); } });
-$("settingsForm").addEventListener("submit", async (e) => { e.preventDefault(); const payload = { maintenance: $("setMaintenance").checked ? "1" : "0", global_rate_limit: $("setRateLimit").value, tg_token: $("setTgToken").value, tg_chatid: $("setTgChatId").value }; await fetch('/api/admin/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) }); toast("Saved!"); await loadData(); });
-$("subadminForm").addEventListener("submit", async (e) => { e.preventDefault(); const payload = { username: $("subUser").value, password: $("subPass").value }; const res = await fetch('/api/admin/add_subadmin', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) }); const d = await res.json(); if(d.success) { toast("Created!"); await loadData(); } else toast("Error"); });
-async function removeAdmin(username) { if(!confirm("Remove?")) return; const res = await fetch(`/api/admin/remove_subadmin/${username}`, { method: 'DELETE' }); if(res.ok) { toast("Removed."); await loadData(); } }
+$("settingsForm").addEventListener("submit", async (e) => { e.preventDefault(); const payload = { maintenance: $("setMaintenance").checked ? "1" : "0", global_rate_limit: $("setRateLimit").value, tg_token: $("setTgToken").value, tg_chatid: $("setTgChatId").value, bot_status: $("setBotStatus").checked ? "1" : "0" }; await fetch('/api/admin/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) }); toast("Saved!"); await loadData(); });
 $("searchInput").addEventListener("input",renderKeys); loadData();
 </script></body></html>
 """
@@ -552,7 +720,7 @@ async def admin_dashboard(admin: dict = Depends(verify_admin)):
     return HTMLResponse(content=ADMIN_HTML)
 
 # ==========================================
-# 🔍 MAIN API ROUTE (Universal Support Added)
+# 🔍 MAIN API ROUTE (Strict + Universal Support)
 # ==========================================
 @app.get("/search")
 async def search_user_data(key: str = Query(...), id: str = Query(None), phone: str = Query(None), username: str = Query(None), email: str = Query(None), request: Request = None):
@@ -595,17 +763,13 @@ async def search_user_data(key: str = Query(...), id: str = Query(None), phone: 
     # Universal Key Logic
     if key_type == "universal":
         if not (id or phone or username or email):
-            return JSONResponse({"error": "Provide at least one search parameter (id, phone, username, or email)."}, status_code=400)
+            return JSONResponse({"error": "Provide at least one search parameter."}, status_code=400)
     else:
         # Strict Validation
-        if key_type == "id":
-            if not id or phone or username or email: return JSONResponse({"error": "This Key is restricted to 'id' only."}, status_code=400)
-        elif key_type == "phone":
-            if not phone or id or username or email: return JSONResponse({"error": "This Key is restricted to 'phone' only."}, status_code=400)
-        elif key_type == "username":
-            if not username or id or phone or email: return JSONResponse({"error": "This Key is restricted to 'username' only."}, status_code=400)
-        elif key_type == "email":
-            if not email or id or phone or username: return JSONResponse({"error": "This Key is restricted to 'email' only."}, status_code=400)
+        if key_type == "id" and (not id or phone or username or email): return JSONResponse({"error": "This Key is restricted to 'id' only."}, status_code=400)
+        if key_type == "phone" and (not phone or id or username or email): return JSONResponse({"error": "This Key is restricted to 'phone' only."}, status_code=400)
+        if key_type == "username" and (not username or id or phone or email): return JSONResponse({"error": "This Key is restricted to 'username' only."}, status_code=400)
+        if key_type == "email" and (not email or id or phone or username): return JSONResponse({"error": "This Key is restricted to 'email' only."}, status_code=400)
 
     cursor = db_conn.cursor()
     query = "SELECT id, username, email, phone, name, address FROM users WHERE 1=1"
