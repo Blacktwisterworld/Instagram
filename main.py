@@ -21,7 +21,6 @@ security = HTTPBasic()
 DB_URL = os.environ.get("DB_URL", "").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip() or None
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-RENDER_URL = "https://instagram-mt84.onrender.com" # Apna Render URL yahan hardcode karo
 
 db_conn = None 
 
@@ -40,21 +39,17 @@ def get_admin_db():
     return psycopg2.connect(DATABASE_URL)
 
 # ==========================================
-# 🗄️ DATABASE SETUP (PostgreSQL)
+# 🗄️ DATABASE SETUP
 # ==========================================
 def init_db():
     if not DATABASE_URL: return
     try:
-        conn = get_admin_db()
-        c = conn.cursor()
-        
-        # Admins
+        conn = get_admin_db(); c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS admins (username TEXT PRIMARY KEY, password TEXT)''')
         c.execute("SELECT count(*) FROM admins")
         if c.fetchone()[0] == 0:
             c.execute("INSERT INTO admins (username, password) VALUES (%s, %s)", ("admin", hash_pass("CyberAdmin123")))
         
-        # API Keys
         c.execute('''CREATE TABLE IF NOT EXISTS api_keys (
             api_key TEXT PRIMARY KEY, owner_name TEXT, expiry_date TEXT, max_limit INTEGER, 
             used_count INTEGER DEFAULT 0, is_active INTEGER DEFAULT 1, created_date TEXT, 
@@ -62,26 +57,22 @@ def init_db():
             key_type TEXT DEFAULT 'id', expiry_alert_sent INTEGER DEFAULT 0
         )''')
         
-        # Bots Table (Naya)
         c.execute('''CREATE TABLE IF NOT EXISTS bots (
             bot_id SERIAL PRIMARY KEY, bot_name TEXT, bot_token TEXT UNIQUE, is_active INTEGER DEFAULT 1, created_at TEXT
         )''')
         
-        # Bot Users Table (Naya)
         c.execute('''CREATE TABLE IF NOT EXISTS bot_users (
             telegram_id TEXT, bot_token TEXT, api_key TEXT, username TEXT, is_blocked INTEGER DEFAULT 0, joined_date TEXT,
             PRIMARY KEY (telegram_id, bot_token)
         )''')
         
-        # Logs & Settings
         c.execute('''CREATE TABLE IF NOT EXISTS search_logs (id SERIAL PRIMARY KEY, api_key TEXT, number TEXT, status TEXT, timestamp TEXT, ip_address TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
         
         for k, v in [("maintenance", "0"), ("global_rate_limit", "1"), ("admin_chat_id", "")]:
             c.execute(f"INSERT INTO settings (key, value) VALUES ('{k}', '{v}') ON CONFLICT (key) DO NOTHING")
         
-        conn.commit()
-        c.close(); conn.close()
+        conn.commit(); c.close(); conn.close()
         print("✅ DB Initialized Successfully!")
     except Exception as e:
         print(f"❌ DB Init Error: {e}")
@@ -100,49 +91,45 @@ def set_setting(key, value):
     c.execute("UPDATE settings SET value = %s WHERE key = %s", (value, key))
     conn.commit(); c.close(); conn.close()
 
+# ✅ FIXED: Telegram message send function with Logging
 def send_tg_msg(bot_token, chat_id, text):
     if not bot_token or not chat_id: return
+    bot_token = str(bot_token).strip() # Space remove
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=5)
-    except: pass
+        r = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
+        print(f"✅ TG SEND [{chat_id}]: {r.status_code} - {r.text}") # Log print karega
+    except Exception as e:
+        print(f"❌ TG SEND ERROR: {e}")
 
 # ==========================================
 # 🕒 BACKGROUND TASK (Expiry Alerts)
 # ==========================================
 async def check_expiry_alerts():
     while True:
-        await asyncio.sleep(3600) # Har 1 ghante mein check karega
+        await asyncio.sleep(3600)
         try:
             def task():
                 conn = get_admin_db(); c = conn.cursor()
                 target_date = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d")
-                
-                # Check keys expiring in 3 days
                 c.execute("SELECT api_key, owner_name, expiry_date FROM api_keys WHERE expiry_date = %s AND expiry_alert_sent = 0", (target_date,))
                 rows = c.fetchall()
                 admin_chat = get_setting("admin_chat_id")
-                
                 for row in rows:
                     key, owner, exp = row
-                    # Alert Admin (via first available bot)
                     c.execute("SELECT bot_token FROM bots WHERE is_active = 1 LIMIT 1")
                     admin_bot = c.fetchone()
                     if admin_chat and admin_bot:
                         send_tg_msg(admin_bot[0], admin_chat, f"⚠️ <b>Key Expiring Soon!</b>\n\nClient: {owner}\nKey: <code>{key}</code>\nExpiry: {exp}")
-                    
-                    # Alert Users who have this key
                     c.execute("SELECT telegram_id, bot_token FROM bot_users WHERE api_key = %s", (key,))
                     bot_users = c.fetchall()
                     for user in bot_users:
                         send_tg_msg(user[1], user[0], f"⚠️ <b>Your API Key is expiring in 3 days!</b>\n\nKey: <code>{key}</code>\nExpiry: {exp}\n\nPlease contact admin to renew.")
-
                     c.execute("UPDATE api_keys SET expiry_alert_sent = 1 WHERE api_key = %s", (key,))
                     conn.commit()
                 c.close(); conn.close()
             await asyncio.to_thread(task)
-        except Exception as e:
-            print(f"Expiry Task Error: {e}")
+        except Exception as e: print(f"Expiry Task Error: {e}")
 
 # ==========================================
 # 🚀 LIFESPAN
@@ -159,22 +146,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"❌ Remote DB Error: {e}")
         raise e
-        
     alert_task = asyncio.create_task(check_expiry_alerts())
-    
     yield
-    
     alert_task.cancel()
     if db_conn: db_conn.close()
 
 app.router.lifespan_context = lifespan
 
 # ==========================================
-# 🤖 MULTI-BOT WEBHOOK
+# 🤖 MULTI-BOT WEBHOOK (FIXED)
 # ==========================================
 @app.post("/webhook/{bot_token}")
 async def telegram_webhook(bot_token: str, request: Request):
-    # Check if this bot exists and is active
+    bot_token = bot_token.strip() # Fix: Space remove
+    
     conn = get_admin_db(); c = conn.cursor()
     c.execute("SELECT is_active FROM bots WHERE bot_token = %s", (bot_token,))
     bot_row = c.fetchone()
@@ -190,7 +175,6 @@ async def telegram_webhook(bot_token: str, request: Request):
         text = data["message"]["text"].strip()
         tg_username = data["message"]["from"].get("username", "Unknown")
         
-        # Check if user is blocked in THIS bot
         c.execute("SELECT is_blocked, api_key FROM bot_users WHERE telegram_id = %s AND bot_token = %s", (chat_id, bot_token))
         user_row = c.fetchone()
         
@@ -199,7 +183,8 @@ async def telegram_webhook(bot_token: str, request: Request):
             c.close(); conn.close()
             return {"ok": True}
 
-        if text == "/start":
+        # ✅ FIXED: startswith handles /start and /start@botname
+        if text.startswith("/start"):
             if user_row and user_row[1]:
                 send_tg_msg(bot_token, chat_id, f"Welcome back! You are logged in with Key: <code>{user_row[1]}</code>.\n\nSend me an ID, Phone, Username or Email to search.")
             else:
@@ -207,7 +192,7 @@ async def telegram_webhook(bot_token: str, request: Request):
             c.close(); conn.close()
             return {"ok": True}
 
-        # LOGIN FLOW (If user has no key)
+        # LOGIN FLOW
         if not user_row or not user_row[1]:
             c.execute("SELECT api_key, expiry_date, is_active, key_type FROM api_keys WHERE api_key = %s", (text,))
             api_row = c.fetchone()
@@ -250,17 +235,15 @@ async def telegram_webhook(bot_token: str, request: Request):
                 c.close(); conn.close()
                 return {"ok": True}
 
-        # Detect Search Field
         search_field = "username"
         if key_type == "universal":
-            if text.isdigit(): search_field = "phone" # Assuming number is phone
+            if text.isdigit(): search_field = "phone"
             else: search_field = "username"
         elif key_type == "id": search_field = "id"
         elif key_type == "phone": search_field = "phone"
         elif key_type == "username": search_field = "username"
         elif key_type == "email": search_field = "email"
 
-        # Execute Search
         cursor = db_conn.cursor()
         query = f"SELECT id, username, email, phone, name, address FROM users WHERE {search_field} = ? LIMIT 5"
         try:
@@ -274,7 +257,6 @@ async def telegram_webhook(bot_token: str, request: Request):
 
         found = len(results) > 0
         status_str = "Found" if found else "Not Found"
-
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         c.execute("UPDATE api_keys SET used_count = used_count + 1, last_request_time = %s WHERE api_key = %s", (now_str, api_key))
         c.execute("INSERT INTO search_logs (api_key, number, status, timestamp, ip_address) VALUES (%s, %s, %s, %s, %s)", (api_key, text, status_str, now_str, f"TG-{chat_id}"))
@@ -292,7 +274,6 @@ async def telegram_webhook(bot_token: str, request: Request):
         
     except Exception as e:
         print(f"Webhook Error: {e}")
-        
     return {"ok": True}
 
 # ==========================================
@@ -308,7 +289,7 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
     return {"username": credentials.username}
 
 # ==========================================
-# 🌐 PUBLIC & CLIENT PORTAL
+# 🌐 PUBLIC STATUS & CLIENT PORTAL
 # ==========================================
 @app.get("/status", response_class=HTMLResponse)
 async def status_page():
@@ -384,28 +365,28 @@ async def generate_key(owner: str = Form(...), days: int = Form(...), limit: int
     created_date = datetime.now().strftime("%Y-%m-%d")
     rate_limit = int(get_setting("global_rate_limit") or 1)
     clean_ip = allowed_ip.strip() if allowed_ip.strip() else None
-    
     conn = get_admin_db(); c = conn.cursor()
     c.execute("INSERT INTO api_keys (api_key, owner_name, expiry_date, max_limit, created_date, rate_limit_seconds, allowed_ip, key_type) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)", (new_key, owner, expiry_date, limit, created_date, rate_limit, clean_ip, key_type))
     conn.commit(); c.close(); conn.close()
     return {"success": True, "key": new_key}
 
-# --- Bot APIs ---
 class BotPayload(BaseModel):
     name: str
     token: str
 
+# ✅ FIXED: Strip token and dynamically get base URL
 @app.post("/api/admin/add_bot")
-async def add_bot(payload: BotPayload, admin: dict = Depends(verify_admin)):
+async def add_bot(payload: BotPayload, request: Request, admin: dict = Depends(verify_admin)):
+    token = payload.token.strip() # Space hatao
+    name = payload.name.strip()
     conn = get_admin_db(); c = conn.cursor()
     try:
-        c.execute("INSERT INTO bots (bot_name, bot_token, created_at) VALUES (%s, %s, %s)", (payload.name, payload.token, datetime.now().strftime("%Y-%m-%d")))
+        c.execute("INSERT INTO bots (bot_name, bot_token, created_at) VALUES (%s, %s, %s)", (name, token, datetime.now().strftime("%Y-%m-%d")))
         conn.commit()
         
-        # Set Webhook automatically
-        webhook_url = f"{RENDER_URL}/webhook/{payload.token}"
-        requests.get(f"https://api.telegram.org/bot{payload.token}/setWebhook?url={webhook_url}")
-        
+        base_url = str(request.base_url).rstrip("/")
+        webhook_url = f"{base_url}/webhook/{token}"
+        requests.get(f"https://api.telegram.org/bot{token}/setWebhook?url={webhook_url}")
         success = True
     except Exception as e:
         print(f"Add Bot Error: {e}")
@@ -420,9 +401,8 @@ class BotActionPayload(BaseModel):
 @app.post("/api/admin/bot_action")
 async def bot_action(payload: BotActionPayload, admin: dict = Depends(verify_admin)):
     conn = get_admin_db(); c = conn.cursor()
-    if payload.action == "toggle":
-        c.execute("UPDATE bots SET is_active = 1 - is_active WHERE bot_token = %s", (payload.token,))
-    elif payload.action == "delete":
+    if payload.action == "toggle": c.execute("UPDATE bots SET is_active = 1 - is_active WHERE bot_token = %s", (payload.token,))
+    elif payload.action == "delete": 
         c.execute("DELETE FROM bots WHERE bot_token = %s", (payload.token,))
         c.execute("DELETE FROM bot_users WHERE bot_token = %s", (payload.token,))
     conn.commit(); c.close(); conn.close()
@@ -436,12 +416,9 @@ class UserActionPayload(BaseModel):
 @app.post("/api/admin/bot_user_action")
 async def bot_user_action(payload: UserActionPayload, admin: dict = Depends(verify_admin)):
     conn = get_admin_db(); c = conn.cursor()
-    if payload.action == "block":
-        c.execute("UPDATE bot_users SET is_blocked = 1 WHERE telegram_id = %s AND bot_token = %s", (payload.tg_id, payload.bot_token))
-    elif payload.action == "unblock":
-        c.execute("UPDATE bot_users SET is_blocked = 0 WHERE telegram_id = %s AND bot_token = %s", (payload.tg_id, payload.bot_token))
-    elif payload.action == "remove_key":
-        c.execute("UPDATE bot_users SET api_key = NULL WHERE telegram_id = %s AND bot_token = %s", (payload.tg_id, payload.bot_token))
+    if payload.action == "block": c.execute("UPDATE bot_users SET is_blocked = 1 WHERE telegram_id = %s AND bot_token = %s", (payload.tg_id, payload.bot_token))
+    elif payload.action == "unblock": c.execute("UPDATE bot_users SET is_blocked = 0 WHERE telegram_id = %s AND bot_token = %s", (payload.tg_id, payload.bot_token))
+    elif payload.action == "remove_key": c.execute("UPDATE bot_users SET api_key = NULL WHERE telegram_id = %s AND bot_token = %s", (payload.tg_id, payload.bot_token))
     conn.commit(); c.close(); conn.close()
     return {"success": True}
 
@@ -453,17 +430,14 @@ class MessagePayload(BaseModel):
 @app.post("/api/admin/send_message")
 async def send_message(payload: MessagePayload, admin: dict = Depends(verify_admin)):
     if payload.tg_id:
-        # Send to single user
         send_tg_msg(payload.bot_token, payload.tg_id, payload.message)
         return {"success": True, "sent": 1}
     else:
-        # Broadcast to all users of this bot
         conn = get_admin_db(); c = conn.cursor()
         c.execute("SELECT telegram_id FROM bot_users WHERE bot_token = %s AND is_blocked = 0", (payload.bot_token,))
         users = c.fetchall()
         c.close(); conn.close()
-        for u in users:
-            send_tg_msg(payload.bot_token, u[0], payload.message)
+        for u in users: send_tg_msg(payload.bot_token, u[0], payload.message)
         return {"success": True, "sent": len(users)}
 
 class SettingsPayload(BaseModel):
@@ -681,14 +655,10 @@ function editKey(key, currentLimit, currentExpiry, currentIp) {
 function deleteKey(key) { if(confirm("Permanently delete this API key?")) { performAction(key, "delete"); $("keyDetails").innerHTML = 'Select a key.'; } }
 async function performAction(key, action, value=null) { try { const res = await fetch('/api/admin/action', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({key, action, value}) }); if(res.ok) { toast("Success!"); await loadData(); } } catch(e) {} }
 
-// --- BOT MANAGER LOGIC ---
 function renderBots() {
     $("botList").innerHTML = bots.map(b => `
         <div class="key-row" style="grid-template-columns: 1fr auto; padding: 10px; border-bottom: 1px solid #10363d;">
-            <div>
-                <strong style="color:var(--cyan)">${escapeHtml(b.name)}</strong>
-                <div style="font-size:10px; color:var(--muted); margin-top:3px;">Token: ${b.token.substring(0, 15)}...</div>
-            </div>
+            <div><strong style="color:var(--cyan)">${escapeHtml(b.name)}</strong><div style="font-size:10px; color:var(--muted); margin-top:3px;">Token: ${b.token.substring(0, 15)}...</div></div>
             <div style="display:flex; gap:5px; align-items:center;">
                 <button class="btn ${b.is_active ? 'danger' : ''}" style="padding:6px 10px; font-size:10px;" onclick="toggleBot('${b.token}')">${b.is_active ? 'Turn OFF' : 'Turn ON'}</button>
                 <button class="btn secondary" style="padding:6px 10px; font-size:10px;" onclick="openBroadcast('${b.token}', '${escapeHtml(b.name)}')">📢 Broadcast</button>
@@ -697,69 +667,19 @@ function renderBots() {
         </div>
     `).join("") || "<p style='color:var(--muted)'>No bots added yet.</p>";
 }
-
 function renderBotUsers() {
     $("botUsersBody").innerHTML = bot_users.map(u => {
         const bot = bots.find(b => b.token === u.bot_token);
-        const botName = bot ? bot.name : "Unknown";
-        return `
-        <tr>
-            <td><b>@${escapeHtml(u.username)}</b><br><small>${u.tg_id}</small><br><small style="color:var(--cyan)">Bot: ${escapeHtml(botName)}</small></td>
-            <td style="color:${u.api_key ? 'var(--green)' : 'var(--red)'}">${u.api_key || "No Key"}</td>
-            <td style="display:flex; flex-direction:column; gap:4px;">
-                <button class="btn ${u.is_blocked ? 'secondary' : 'danger'}" style="padding:4px 8px; font-size:10px;" onclick="botUserAction('${u.tg_id}', '${u.bot_token}', '${u.is_blocked ? 'unblock' : 'block'}')">${u.is_blocked ? 'Unblock' : 'Block'}</button>
-                <button class="btn secondary" style="padding:4px 8px; font-size:10px;" onclick="openDM('${u.tg_id}', '${u.bot_token}', '${escapeHtml(u.username)}')">💬 DM</button>
-                <button class="btn danger" style="padding:4px 8px; font-size:10px;" onclick="botUserAction('${u.tg_id}', '${u.bot_token}', 'remove_key')">Remove Key</button>
-            </td>
-        </tr>
-    `}).join("") || "<tr><td colspan='3'>No bot users.</td></tr>";
+        return `<tr><td><b>@${escapeHtml(u.username)}</b><br><small>${u.tg_id}</small><br><small style="color:var(--cyan)">Bot: ${bot ? escapeHtml(bot.name) : 'Unknown'}</small></td><td style="color:${u.api_key ? 'var(--green)' : 'var(--red)'}">${u.api_key || "No Key"}</td><td style="display:flex; flex-direction:column; gap:4px;"><button class="btn ${u.is_blocked ? 'secondary' : 'danger'}" style="padding:4px 8px; font-size:10px;" onclick="botUserAction('${u.tg_id}', '${u.bot_token}', '${u.is_blocked ? 'unblock' : 'block'}')">${u.is_blocked ? 'Unblock' : 'Block'}</button><button class="btn secondary" style="padding:4px 8px; font-size:10px;" onclick="openDM('${u.tg_id}', '${u.bot_token}', '${escapeHtml(u.username)}')">💬 DM</button><button class="btn danger" style="padding:4px 8px; font-size:10px;" onclick="botUserAction('${u.tg_id}', '${u.bot_token}', 'remove_key')">Remove Key</button></td></tr>`
+    }).join("") || "<tr><td colspan='3'>No bot users.</td></tr>";
 }
-
-async function toggleBot(token) {
-    await fetch('/api/admin/bot_action', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token, action: 'toggle'}) });
-    toast("Bot status updated"); await loadData();
-}
-async function deleteBot(token) {
-    if(!confirm("Delete this bot permanently?")) return;
-    await fetch('/api/admin/bot_action', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token, action: 'delete'}) });
-    toast("Bot deleted"); await loadData();
-}
-async function botUserAction(tg_id, bot_token, action) {
-    if(!confirm("Are you sure?")) return;
-    await fetch('/api/admin/bot_user_action', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({tg_id, bot_token, action}) });
-    toast("Action done"); await loadData();
-}
-
-// Broadcast Modal
-function openBroadcast(token, name) {
-    selectedBotForBC = token;
-    $("bcBotName").textContent = name;
-    $("bcMsg").value = "";
-    $("broadcastModal").style.display = "flex";
-}
-async function sendBroadcast() {
-    const msg = $("bcMsg").value.trim();
-    if(!msg) return toast("Message khali hai!");
-    toast("Sending...");
-    const res = await fetch('/api/admin/send_message', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({bot_token: selectedBotForBC, message: msg}) });
-    const data = await res.json();
-    if(data.success) { toast(`Sent to ${data.sent} users!`); closeModal(); }
-}
-
-// DM Modal
-function openDM(tg_id, bot_token, username) {
-    selectedUserForDM = { tg_id, bot_token };
-    $("dmUser").textContent = "@" + username;
-    $("dmMsg").value = "";
-    $("dmModal").style.display = "flex";
-}
-async function sendDirectMsg() {
-    const msg = $("dmMsg").value.trim();
-    if(!msg) return toast("Message khali hai!");
-    toast("Sending...");
-    const res = await fetch('/api/admin/send_message', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({bot_token: selectedUserForDM.bot_token, tg_id: selectedUserForDM.tg_id, message: msg}) });
-    if(res.ok) { toast("Sent!"); closeModal(); }
-}
+async function toggleBot(token) { await fetch('/api/admin/bot_action', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token, action: 'toggle'}) }); toast("Bot status updated"); await loadData(); }
+async function deleteBot(token) { if(!confirm("Delete this bot permanently?")) return; await fetch('/api/admin/bot_action', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token, action: 'delete'}) }); toast("Bot deleted"); await loadData(); }
+async function botUserAction(tg_id, bot_token, action) { if(!confirm("Are you sure?")) return; await fetch('/api/admin/bot_user_action', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({tg_id, bot_token, action}) }); toast("Action done"); await loadData(); }
+function openBroadcast(token, name) { selectedBotForBC = token; $("bcBotName").textContent = name; $("bcMsg").value = ""; $("broadcastModal").style.display = "flex"; }
+async function sendBroadcast() { const msg = $("bcMsg").value.trim(); if(!msg) return toast("Message khali hai!"); toast("Sending..."); const res = await fetch('/api/admin/send_message', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({bot_token: selectedBotForBC, message: msg}) }); const data = await res.json(); if(data.success) { toast(`Sent to ${data.sent} users!`); closeModal(); } }
+function openDM(tg_id, bot_token, username) { selectedUserForDM = { tg_id, bot_token }; $("dmUser").textContent = "@" + username; $("dmMsg").value = ""; $("dmModal").style.display = "flex"; }
+async function sendDirectMsg() { const msg = $("dmMsg").value.trim(); if(!msg) return toast("Message khali hai!"); toast("Sending..."); const res = await fetch('/api/admin/send_message', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({bot_token: selectedUserForDM.bot_token, tg_id: selectedUserForDM.tg_id, message: msg}) }); if(res.ok) { toast("Sent!"); closeModal(); } }
 function closeModal() { $("broadcastModal").style.display = "none"; $("dmModal").style.display = "none"; }
 
 async function loadData() {
@@ -767,18 +687,11 @@ async function loadData() {
         const res = await fetch('/api/admin/dashboard'); const data = await res.json();
         keys = data.keys; logs = data.logs; bots = data.bots; bot_users = data.bot_users; currentSettings = data.settings;
         updateStats(data.stats); renderKeys(); renderChart(data.chart_data); renderBots(); renderBotUsers();
-        
         $("logsBody").innerHTML = logs.map(l => `<tr><td style="color:var(--muted)">${l.time}</td><td style="color:var(--cyan)">${l.key}</td><td>${l.number}</td><td style="color:var(--muted)">${l.ip}</td><td style="color:${l.status==='Found'?'var(--green)':'var(--red)'}">${l.status}</td></tr>`).join("");
         if($("page-settings").classList.contains('active')) loadSettingsUI();
     } catch(e) { toast("Error loading data"); }
 }
-
-$("addBotForm").addEventListener("submit", async (e)=>{ 
-    e.preventDefault(); 
-    const payload = { name: $("botName").value, token: $("botToken").value };
-    const res = await fetch('/api/admin/add_bot', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) }); 
-    if(res.ok) { const r = await res.json(); if(r.success) { toast("Bot Added & Webhook Set!"); $("botName").value=""; $("botToken").value=""; await loadData(); } else { toast("Error: Invalid Token or Duplicate"); } } 
-});
+$("addBotForm").addEventListener("submit", async (e)=>{ e.preventDefault(); const payload = { name: $("botName").value, token: $("botToken").value }; const res = await fetch('/api/admin/add_bot', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) }); if(res.ok) { const r = await res.json(); if(r.success) { toast("Bot Added & Webhook Set!"); $("botName").value=""; $("botToken").value=""; await loadData(); } else { toast("Error: Invalid Token or Duplicate"); } } });
 $("keyForm").addEventListener("submit", async (e)=>{ e.preventDefault(); const fd = new FormData(); fd.append("owner", $("owner").value); fd.append("key_type", $("key_type").value); fd.append("days", $("expiry").value); fd.append("limit", $("limit").value); fd.append("allowed_ip", $("allowed_ip").value); const res = await fetch('/api/admin/generate', { method: 'POST', body: fd }); if(res.ok) { const r = await res.json(); toast("Key: " + r.key); await loadData(); } });
 $("settingsForm").addEventListener("submit", async (e) => { e.preventDefault(); const payload = { maintenance: $("setMaintenance").checked ? "1" : "0", global_rate_limit: $("setRateLimit").value, admin_chat_id: $("setAdminChatId").value }; await fetch('/api/admin/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) }); toast("Saved!"); await loadData(); });
 $("searchInput").addEventListener("input",renderKeys); loadData();
@@ -802,27 +715,14 @@ async def search_user_data(key: str = Query(...), id: str = Query(None), phone: 
     c.execute("SELECT expiry_date, max_limit, used_count, is_active, rate_limit_seconds, last_request_time, allowed_ip, key_type FROM api_keys WHERE api_key = %s", (key,))
     row = c.fetchone()
 
-    if not row:
-        c.close(); conn.close()
-        return JSONResponse({"error": "Invalid API Key", "credits": CREDITS}, status_code=401)
+    if not row: c.close(); conn.close(); return JSONResponse({"error": "Invalid API Key", "credits": CREDITS}, status_code=401)
 
     expiry_str, max_limit, used_count, is_active, rate_limit, last_req_str, allowed_ip, key_type = row
 
-    if allowed_ip and allowed_ip.strip() != "" and client_ip != allowed_ip.strip():
-        c.close(); conn.close()
-        return JSONResponse({"error": f"Access Denied. IP mismatch."}, status_code=403)
-
-    if not is_active:
-        c.close(); conn.close()
-        return JSONResponse({"error": "API Key is blocked by Admin", "credits": CREDITS}, status_code=403)
-
-    if datetime.strptime(expiry_str, "%Y-%m-%d").date() < datetime.now().date():
-        c.close(); conn.close()
-        return JSONResponse({"error": "API Key Expired", "credits": CREDITS}, status_code=403)
-
-    if used_count >= max_limit:
-        c.close(); conn.close()
-        return JSONResponse({"error": "API Limit Exceeded", "credits": CREDITS}, status_code=429)
+    if allowed_ip and allowed_ip.strip() != "" and client_ip != allowed_ip.strip(): c.close(); conn.close(); return JSONResponse({"error": f"Access Denied. IP mismatch."}, status_code=403)
+    if not is_active: c.close(); conn.close(); return JSONResponse({"error": "API Key is blocked by Admin", "credits": CREDITS}, status_code=403)
+    if datetime.strptime(expiry_str, "%Y-%m-%d").date() < datetime.now().date(): c.close(); conn.close(); return JSONResponse({"error": "API Key Expired", "credits": CREDITS}, status_code=403)
+    if used_count >= max_limit: c.close(); conn.close(); return JSONResponse({"error": "API Limit Exceeded", "credits": CREDITS}, status_code=429)
 
     if last_req_str:
         last_req_time = datetime.strptime(last_req_str, "%Y-%m-%d %H:%M:%S")
@@ -831,8 +731,7 @@ async def search_user_data(key: str = Query(...), id: str = Query(None), phone: 
             return JSONResponse({"error": f"Rate limit exceeded. Wait {rate_limit}s."}, status_code=429)
 
     if key_type == "universal":
-        if not (id or phone or username or email):
-            return JSONResponse({"error": "Provide at least one search parameter."}, status_code=400)
+        if not (id or phone or username or email): return JSONResponse({"error": "Provide at least one search parameter."}, status_code=400)
     else:
         if key_type == "id" and (not id or phone or username or email): return JSONResponse({"error": "This Key is restricted to 'id' only."}, status_code=400)
         if key_type == "phone" and (not phone or id or username or email): return JSONResponse({"error": "This Key is restricted to 'phone' only."}, status_code=400)
@@ -875,7 +774,6 @@ async def search_user_data(key: str = Query(...), id: str = Query(None), phone: 
             send_tg_msg(admin_bot[0], admin_chat, f"⚠️ <b>API Limit Alert (90%)!</b>\n\nKey: <code>{key}</code>\nUsed: {used_count + 1}/{max_limit}")
         
     c.close(); conn.close()
-
     return JSONResponse({"status": "Success" if found else "Not Found", "time_taken_ms": search_time, "credits": CREDITS, "total_results": len(results), "data": results})
 
 if __name__ == "__main__":
